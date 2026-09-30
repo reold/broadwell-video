@@ -11,7 +11,6 @@ pub fn check(rc: i32, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// All FFmpeg state for one open file. Owned by App.
 pub struct Handles {
     pub fmt_ctx: *mut AVFormatContext,
     pub codec_ctx: *mut AVCodecContext,
@@ -23,6 +22,9 @@ pub struct Handles {
     pub width: u32,
     pub height: u32,
     pub fps: f64,
+    pub duration_ms: i64,
+    pub time_base_num: i32,
+    pub time_base_den: i32,
 }
 
 impl Handles {
@@ -64,6 +66,15 @@ impl Handles {
             let height = (*codecpar).height as u32;
             let fps_val = av_q2d((*stream).r_frame_rate);
             let fps = if fps_val > 0.0 { fps_val } else { 30.0 };
+
+            let duration_ms = if (*fmt_ctx).duration > 0 {
+                (*fmt_ctx).duration / (AV_TIME_BASE as i64 / 1000)
+            } else {
+                0
+            };
+
+            let time_base_num = (*stream).time_base.num;
+            let time_base_den = (*stream).time_base.den;
 
             let codec = avcodec_find_decoder((*codecpar).codec_id);
             if codec.is_null() {
@@ -109,6 +120,9 @@ impl Handles {
                 width,
                 height,
                 fps,
+                duration_ms,
+                time_base_num,
+                time_base_den,
             })
         }
     }
@@ -123,6 +137,47 @@ impl Handles {
             avcodec_flush_buffers(self.codec_ctx);
             av_frame_unref(self.decoded);
             av_packet_unref(self.packet);
+        }
+    }
+
+    pub unsafe fn seek_to_ms(&mut self, ms: i64) -> Result<()> {
+        unsafe {
+            let ts = av_rescale_q(
+                ms,
+                AVRational { num: 1, den: 1000 },
+                AVRational {
+                    num: self.time_base_num,
+                    den: self.time_base_den,
+                },
+            );
+            check(
+                av_seek_frame(self.fmt_ctx, self.video_stream, ts, AVSEEK_FLAG_BACKWARD),
+                "av_seek_frame",
+            )?;
+            avcodec_flush_buffers(self.codec_ctx);
+            av_frame_unref(self.decoded);
+            av_packet_unref(self.packet);
+            Ok(())
+        }
+    }
+
+    pub unsafe fn current_pts_ms(&self) -> i64 {
+        unsafe {
+            if self.decoded.is_null() {
+                return 0;
+            }
+            let pts = (*self.decoded).best_effort_timestamp;
+            if pts < 0 {
+                return 0;
+            }
+            av_rescale_q(
+                pts,
+                AVRational {
+                    num: self.time_base_num,
+                    den: self.time_base_den,
+                },
+                AVRational { num: 1, den: 1000 },
+            )
         }
     }
 }

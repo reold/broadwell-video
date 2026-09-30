@@ -1973,6 +1973,7 @@ dependencies = [
  "ffmpeg-sys-next",
  "grafting",
  "libc",
+ "serde",
  "wgpu",
 ]
 

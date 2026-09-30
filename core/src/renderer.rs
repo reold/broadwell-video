@@ -1,8 +1,6 @@
-//! Shared preview pipeline. Owns the FFmpeg decoder, the wgpu pipelines,
-//! and the DMA-BUF texture cache. Callers provide a surface + config and
-//! drive the frame loop; this module handles decode → import → grade → blit.
+//! Shared preview pipeline.
 
-use crate::{ffmpeg, gpu};
+use crate::{ffmpeg, gpu, state::SharedState};
 use anyhow::Result;
 use ffmpeg_sys_next::*;
 use std::collections::HashMap;
@@ -15,6 +13,12 @@ const MAX_CACHE_ENTRIES: usize = 64;
 pub enum FrameOutcome {
     Processed,
     Skipped,
+    Paused,
+    Eof,
+}
+
+enum DecodeStep {
+    Frame,
     Eof,
 }
 
@@ -23,8 +27,11 @@ pub struct PreviewRenderer {
     pub host: grafting::HostWgpuContext,
     pub pipelines: gpu::Pipelines,
     pub texture_cache: HashMap<gpu::CacheKey, gpu::CachedNv12>,
+    pub state: SharedState,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    /// After a seek, decode frames until PTS >= this value before rendering.
+    prune_to_ms: Option<i64>,
 }
 
 impl PreviewRenderer {
@@ -32,11 +39,21 @@ impl PreviewRenderer {
         host: grafting::HostWgpuContext,
         video_path: &str,
         surface_format: wgpu::TextureFormat,
+        state: SharedState,
     ) -> Result<Self> {
         let ff = unsafe { ffmpeg::Handles::open(video_path, "/dev/dri/renderD128")? };
         let vw = ff.width;
         let vh = ff.height;
-        println!("Video: {vw}x{vh} @ {:.2} fps", ff.fps);
+        println!(
+            "Video: {vw}x{vh} @ {:.2} fps, duration {} ms",
+            ff.fps, ff.duration_ms
+        );
+
+        {
+            let mut s = state.lock().unwrap();
+            s.duration_ms = ff.duration_ms;
+            s.fps = ff.fps;
+        }
 
         let pipelines = gpu::build_pipelines(&host, surface_format, vw, vh);
 
@@ -45,9 +62,52 @@ impl PreviewRenderer {
             host,
             pipelines,
             texture_cache: HashMap::new(),
+            state,
             cache_hits: 0,
             cache_misses: 0,
+            prune_to_ms: None,
         })
+    }
+
+    /// Pull one frame out of the decoder. Reads new packets on demand.
+    unsafe fn decode_step(&mut self) -> DecodeStep {
+        unsafe {
+            loop {
+                let rc = avcodec_receive_frame(self.ff.codec_ctx, self.ff.decoded);
+                if rc == 0 {
+                    return DecodeStep::Frame;
+                }
+                if rc == -libc::EAGAIN {
+                    // Decoder needs more input.
+                    let rc = av_read_frame(self.ff.fmt_ctx, self.ff.packet);
+                    if rc < 0 {
+                        // End of stream: flush and drain.
+                        avcodec_send_packet(self.ff.codec_ctx, std::ptr::null());
+                        continue;
+                    }
+                    if (*self.ff.packet).stream_index != self.ff.video_stream {
+                        av_packet_unref(self.ff.packet);
+                        continue;
+                    }
+                    let _ = avcodec_send_packet(self.ff.codec_ctx, self.ff.packet);
+                    av_packet_unref(self.ff.packet);
+                    continue;
+                }
+                // Any other negative value is AVERROR_EOF or a decode error.
+                return DecodeStep::Eof;
+            }
+        }
+    }
+
+    /// Consume the pending seek, if any, and set the prune target.
+    fn take_pending_seek(&mut self) -> Option<i64> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(ms) = s.pending_seek_ms.take() {
+            s.position_ms = ms;
+            Some(ms)
+        } else {
+            None
+        }
     }
 
     pub fn render_frame(
@@ -58,33 +118,60 @@ impl PreviewRenderer {
         let vw = self.ff.width;
         let vh = self.ff.height;
 
+        // ---- Should we do anything this call? ----
+        let (playing, had_seek) = {
+            let s = self.state.lock().unwrap();
+            (s.playing, s.pending_seek_ms.is_some())
+        };
+        if !playing && !had_seek {
+            return Ok(FrameOutcome::Paused);
+        }
+
+        // ---- Process any initial pending seek ----
+        if let Some(ms) = self.take_pending_seek() {
+            unsafe {
+                self.ff.seek_to_ms(ms)?;
+            }
+            self.prune_to_ms = Some(ms);
+        }
+
+        // ---- Decode, pruning toward the target in one tight loop ----
+        //
+        // This is the fix for scrubbing: the loop runs to completion inside
+        // a single call, decoding as many frames as needed. Each iteration
+        // also re-checks for a *newer* seek so fast drags short-circuit.
         unsafe {
-            // ---- decode ----
-            let rc = av_read_frame(self.ff.fmt_ctx, self.ff.packet);
-            if rc < 0 {
-                self.ff.rewind();
-                return Ok(FrameOutcome::Eof);
-            }
-            if (*self.ff.packet).stream_index != self.ff.video_stream {
-                av_packet_unref(self.ff.packet);
-                return Ok(FrameOutcome::Skipped);
-            }
-            if avcodec_send_packet(self.ff.codec_ctx, self.ff.packet) < 0 {
-                av_packet_unref(self.ff.packet);
-                return Ok(FrameOutcome::Skipped);
-            }
-            av_packet_unref(self.ff.packet);
+            loop {
+                if let Some(ms) = self.take_pending_seek() {
+                    self.ff.seek_to_ms(ms)?;
+                    self.prune_to_ms = Some(ms);
+                }
 
-            let rc = avcodec_receive_frame(self.ff.codec_ctx, self.ff.decoded);
-            if rc == -libc::EAGAIN {
-                return Ok(FrameOutcome::Skipped);
-            }
-            if rc != 0 {
-                eprintln!("avcodec_receive_frame rc={rc}");
-                return Ok(FrameOutcome::Eof);
+                match self.decode_step() {
+                    DecodeStep::Frame => {}
+                    DecodeStep::Eof => {
+                        self.ff.rewind();
+                        self.prune_to_ms = None;
+                        return Ok(FrameOutcome::Eof);
+                    }
+                }
+
+                let pts = self.ff.current_pts_ms();
+
+                if let Some(target) = self.prune_to_ms {
+                    if pts < target {
+                        av_frame_unref(self.ff.decoded);
+                        continue;
+                    }
+                    self.prune_to_ms = None;
+                }
+
+                // This is the frame we render.
+                self.state.lock().unwrap().position_ms = pts;
+                break;
             }
 
-            // ---- map decoded NV12 to DRM_PRIME ----
+            // ---- Import the decoded NV12 frame ----
             (*self.ff.drm_frame).format = AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
             ffmpeg::check(
                 av_hwframe_map(
@@ -241,7 +328,7 @@ impl PreviewRenderer {
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
 
-            // ---- grade + blit in one encoder ----
+            // ---- grade + blit ----
             let grade_bg = self
                 .host
                 .device

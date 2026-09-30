@@ -13,3 +13,4 @@ dpi.workspace = true
 wgpu.workspace = true
 ffmpeg-sys-next.workspace = true
 grafting.workspace = true
+serde.workspace = true

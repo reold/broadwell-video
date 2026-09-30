@@ -1,0 +1,54 @@
+:root {
+    /* Blender-derived dark palette */
+    --bg-window:    #1d1d1d;
+    --bg-panel:     #2b2b2b;
+    --bg-header:    #3d3d3d;
+    --bg-widget:    #545454;
+    --bg-hover:     #656565;
+
+    --text:         #e5e5e5;
+    --text-dim:     #a0a0a0;
+    --text-muted:   #6a6a6a;
+
+    --accent:       #4772b3;
+    --accent-hover: #5880c0;
+    --playhead:     #ff8c00;
+
+    --border:       #131313;
+    --border-light: #454545;
+
+    /* Clip colors by media kind */
+    --clip-video:   #3a5a7a;
+    --clip-audio:   #2f5040;
+    --clip-effect:  #6a4a7a;
+    --clip-text:    #7a5a3a;
+
+    /* Typography */
+    --font-ui:      -apple-system, "Inter", "Segoe UI", system-ui, sans-serif;
+    --font-mono:    "JetBrains Mono", "Fira Code", "Menlo", monospace;
+    --font-size:    13px;
+    --font-size-sm: 11px;
+    --font-size-xs: 10px;
+
+    /* Metrics */
+    --toolbar-h:    40px;
+    --ruler-h:      24px;
+    --track-h:      44px;
+    --track-header-w: 60px;
+}
+
+html, body {
+    background: transparent;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    height: 100%;
+    font-family: var(--font-ui);
+    font-size: var(--font-size);
+    color: var(--text);
+}
+
+button {
+    font-family: inherit;
+    font-size: inherit;
+}

@@ -2,6 +2,7 @@ extern crate gdk_wayland_sys;
 
 mod wayland_subsurface;
 
+use hwa_core::state::{SharedState, new_shared};
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
@@ -10,7 +11,7 @@ use std::{
     ptr::NonNull,
     time::{Duration, Instant},
 };
-use tauri::Manager;
+use tauri::{Emitter, Manager, State};
 use wayland_subsurface::WaylandSubsurface;
 
 #[tauri::command]
@@ -18,7 +19,37 @@ fn greet(name: &str) -> String {
     format!("Hello, {name}! IPC works.")
 }
 
-fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
+#[tauri::command]
+fn log_msg(msg: String) {
+    println!("[frontend] {msg}");
+}
+
+#[tauri::command]
+fn get_state(state: State<'_, SharedState>) -> hwa_core::state::StateSnapshot {
+    state.lock().unwrap().snapshot()
+}
+
+#[tauri::command]
+fn toggle_play(state: State<'_, SharedState>) -> bool {
+    let mut s = state.lock().unwrap();
+    s.playing = !s.playing;
+    s.playing
+}
+
+#[tauri::command]
+fn set_paused(state: State<'_, SharedState>, paused: bool) {
+    state.lock().unwrap().playing = !paused;
+}
+
+#[tauri::command]
+fn seek_to(state: State<'_, SharedState>, ms: i64) {
+    println!("[tauri] seek_to({ms})");
+    let mut s = state.lock().unwrap();
+    s.pending_seek_ms = Some(ms);
+    s.position_ms = ms;
+}
+
+fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow, shared: SharedState) {
     let display_ptr = subsurface.display_ptr();
     let surface_ptr = subsurface.surface_ptr();
 
@@ -122,29 +153,25 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
         let video_path = std::env::var("HWA_VIDEO")
             .unwrap_or_else(|_| "/home/reold/Downloads/jellyfish-15-mbps-hd-h264.mkv".into());
 
-        let mut renderer = match hwa_core::renderer::PreviewRenderer::new(host, &video_path, format)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("PreviewRenderer::new failed: {e:?}");
-                return;
-            }
-        };
+        let mut renderer =
+            match hwa_core::renderer::PreviewRenderer::new(host, &video_path, format, shared) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("PreviewRenderer::new failed: {e:?}");
+                    return;
+                }
+            };
 
-        // ---- Timing accumulators ----
         let mut frames: u64 = 0;
         let mut last_log = Instant::now();
         let mut t_total = Duration::ZERO;
-        let mut t_resize = Duration::ZERO;
         let mut t_render = Duration::ZERO;
-        let mut t_sleep = Duration::ZERO;
+        let mut last_emit = Instant::now();
         let mut last_size = (config.width, config.height);
 
         loop {
             let iter_start = Instant::now();
 
-            // ---- resize check ----
-            let t = Instant::now();
             if let Ok(sz) = window.inner_size() {
                 if sz.width > 0 && sz.height > 0 {
                     let new_w = sz.width;
@@ -157,9 +184,7 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
                     }
                 }
             }
-            t_resize += t.elapsed();
 
-            // ---- render ----
             let t = Instant::now();
             match renderer.render_frame(&surface, &config) {
                 Ok(_) => {}
@@ -170,14 +195,17 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
             }
             t_render += t.elapsed();
 
-            // ---- sleep to hit source framerate ----
-            let t = Instant::now();
+            if last_emit.elapsed() >= Duration::from_millis(50) {
+                let snap = renderer.state.lock().unwrap().snapshot();
+                let _ = window.emit("playhead_update", &snap);
+                last_emit = Instant::now();
+            }
+
             let period = renderer.frame_period();
             let elapsed = iter_start.elapsed();
             if elapsed < period {
                 std::thread::sleep(period - elapsed);
             }
-            t_sleep += t.elapsed();
 
             t_total += iter_start.elapsed();
             frames += 1;
@@ -185,23 +213,23 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
             if last_log.elapsed() >= Duration::from_secs(2) {
                 let n = frames as f64;
                 let secs = last_log.elapsed().as_secs_f64();
+                let snap = renderer.state.lock().unwrap().snapshot();
                 println!(
-                    "preview {:.1} fps (target {:.2}) | iter {:.2} ms | resize {:.2} render {:.2} sleep {:.2} | cache h{} m{} sz{}",
+                    "preview {:.1} fps (target {:.2}) | iter {:.2} ms | render {:.2} | pos {} / {} ms | playing {} | cache h{} m{} sz{}",
                     n / secs,
                     renderer.ff.fps,
                     t_total.as_secs_f64() * 1000.0 / n,
-                    t_resize.as_secs_f64() * 1000.0 / n,
                     t_render.as_secs_f64() * 1000.0 / n,
-                    t_sleep.as_secs_f64() * 1000.0 / n,
+                    snap.position_ms,
+                    snap.duration_ms,
+                    snap.playing,
                     renderer.cache_hits,
                     renderer.cache_misses,
                     renderer.texture_cache.len(),
                 );
                 frames = 0;
                 t_total = Duration::ZERO;
-                t_resize = Duration::ZERO;
                 t_render = Duration::ZERO;
-                t_sleep = Duration::ZERO;
                 renderer.cache_hits = 0;
                 renderer.cache_misses = 0;
                 last_log = Instant::now();
@@ -212,10 +240,20 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let shared = new_shared();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
-        .setup(|app| {
+        .manage(shared.clone())
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            log_msg,
+            get_state,
+            toggle_play,
+            set_paused,
+            seek_to,
+        ])
+        .setup(move |app| {
             let window = app.get_webview_window("main").unwrap();
 
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -233,7 +271,7 @@ pub fn run() {
                 }
             };
 
-            spawn_video(subsurface, window);
+            spawn_video(subsurface, window, shared.clone());
             Ok(())
         })
         .run(tauri::generate_context!())

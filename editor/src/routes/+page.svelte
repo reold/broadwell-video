@@ -1,26 +1,39 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
+  import { onMount } from "svelte";
 
-  let playheadPx = $state(180);
+  type StateSnapshot = {
+    playing: boolean;
+    position_ms: number;
+    duration_ms: number;
+    fps: number;
+  };
+
+  let positionMs = $state(0);
+  let durationMs = $state(60_000);
+  let playing = $state(true);
   let pxPerSecond = $state(40);
-  let totalSeconds = $state(60);
   let dragging = $state(false);
-  let ipcMsg = $state("");
   let lanesEl: HTMLDivElement;
+  let lastSeekAt = 0;
 
-  let playheadSeconds = $derived(playheadPx / pxPerSecond);
-  let formattedTime = $derived(formatTc(playheadSeconds));
+  let playheadPx = $derived((positionMs / 1000) * pxPerSecond);
+  let totalSeconds = $derived(durationMs / 1000);
+  let formattedTime = $derived(formatTc(positionMs / 1000));
 
-  const clips = [
-    { lane: 0, start: 2,  dur: 8,  label: "intro.mp4",   kind: "video" },
-    { lane: 0, start: 10, dur: 6,  label: "b_roll.mp4",  kind: "video" },
-    { lane: 0, start: 16, dur: 11, label: "talking.mp4", kind: "video" },
-    { lane: 1, start: 0,  dur: 12, label: "overlay.png", kind: "effect" },
-    { lane: 1, start: 18, dur: 5,  label: "title.text",  kind: "effect" },
-    { lane: 2, start: 0,  dur: 27, label: "music.mp3",   kind: "audio" },
-  ];
-
-  const laneNames = ["V2", "V1", "A1"];
+  let tickStep = $derived(
+    totalSeconds <= 30 ? 1 :
+    totalSeconds <= 120 ? 5 :
+    totalSeconds <= 600 ? 30 :
+    60
+  );
+  let ticks = $derived(
+    Array.from(
+      { length: Math.floor(totalSeconds / tickStep) + 1 },
+      (_, i) => i * tickStep
+    )
+  );
 
   function formatTc(sec: number): string {
     const s = Math.max(0, sec);
@@ -32,65 +45,95 @@
     return `${p(hh)}:${p(mm)}:${p(ss)}:${p(ff)}`;
   }
 
-  function startDrag(e: PointerEvent) {
-    dragging = true;
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    movePlayhead(e);
+  onMount(() => {
+    invoke<StateSnapshot>("get_state").then((s) => {
+      positionMs = s.position_ms;
+      durationMs = s.duration_ms || 60_000;
+      playing = s.playing;
+    });
+
+    const unlisten = listen<StateSnapshot>("playhead_update", (event) => {
+      const s = event.payload;
+      if (!dragging) {
+        positionMs = s.position_ms;
+      }
+      durationMs = s.duration_ms || durationMs;
+      playing = s.playing;
+    });
+
+    return () => {
+      unlisten.then((f) => f());
+    };
+  });
+
+  function togglePlay() {
+    invoke<boolean>("toggle_play").then((p) => (playing = p));
   }
 
-  function movePlayhead(e: PointerEvent) {
-    if (!dragging || !lanesEl) return;
+  // ---- Drag handling with global listeners ----
+
+  function beginDrag(e: PointerEvent) {
+    if (e.button !== 0) return;
+    dragging = true;
+    invoke("log_msg", { msg: `beginDrag clientX=${e.clientX}` });
+    seekFromPointer(e, true);
+
+    window.addEventListener("pointermove", onWindowPointerMove);
+    window.addEventListener("pointerup", onWindowPointerUp);
+  }
+
+  function onWindowPointerMove(e: PointerEvent) {
+    if (!dragging) return;
+    seekFromPointer(e, false);
+  }
+
+  function onWindowPointerUp(_e: PointerEvent) {
+    if (!dragging) return;
+    dragging = false;
+    invoke("log_msg", { msg: `endDrag pos=${Math.round(positionMs)}` });
+    window.removeEventListener("pointermove", onWindowPointerMove);
+    window.removeEventListener("pointerup", onWindowPointerUp);
+    invoke("seek_to", { ms: Math.round(positionMs) });
+  }
+
+  function seekFromPointer(e: PointerEvent, immediate: boolean) {
+    if (!lanesEl) {
+      invoke("log_msg", { msg: "lanesEl is null" });
+      return;
+    }
     const rect = lanesEl.getBoundingClientRect();
     const x = e.clientX - rect.left + lanesEl.scrollLeft;
-    playheadPx = Math.max(0, Math.min(x, totalSeconds * pxPerSecond));
-  }
+    const px = Math.max(0, Math.min(x, totalSeconds * pxPerSecond));
+    positionMs = (px / pxPerSecond) * 1000;
 
-  function endDrag(e: PointerEvent) {
-    dragging = false;
-    (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-    invoke("greet", { name: formattedTime }).then((r) => (ipcMsg = r as string));
-  }
-
-  function onRulerClick(e: MouseEvent) {
-    const rect = lanesEl.getBoundingClientRect();
-    playheadPx = Math.max(0, e.clientX - rect.left + lanesEl.scrollLeft);
-  }
-
-  function onRulerKey(e: KeyboardEvent) {
-    if (e.key === "ArrowLeft") {
-      playheadPx = Math.max(0, playheadPx - pxPerSecond / 2);
-    } else if (e.key === "ArrowRight") {
-      playheadPx = Math.min(totalSeconds * pxPerSecond, playheadPx + pxPerSecond / 2);
+    const now = performance.now();
+    if (immediate || now - lastSeekAt > 120) {
+      lastSeekAt = now;
+      invoke("seek_to", { ms: Math.round(positionMs) });
     }
   }
-
-  let ticks = $derived(Array.from({ length: totalSeconds + 1 }, (_, i) => i));
 </script>
 
-<svelte:head>
-  <style>
-    html, body {
-      background: transparent !important;
-      margin: 0;
-      padding: 0;
-      overflow: hidden;
-      height: 100%;
-    }
-  </style>
-</svelte:head>
-
 <div class="timeline-root">
-  <!-- Reserved space for the video preview. Nothing is drawn here, so the
-       wgpu subsurface underneath shows through. -->
   <div class="preview-spacer"></div>
 
-  <!-- Bottom 300px: actual UI -->
   <div class="ui-bottom">
     <div class="toolbar">
       <div class="transport">
-        <button type="button" title="Play">▶</button>
-        <button type="button" title="Pause">⏸</button>
-        <button type="button" title="Stop">⏹</button>
+        <button
+          type="button"
+          title={playing ? "Pause" : "Play"}
+          onclick={togglePlay}
+        >
+          {playing ? "⏸" : "▶"}
+        </button>
+        <button
+          type="button"
+          title="Stop"
+          onclick={() => invoke("seek_to", { ms: 0 })}
+        >
+          ⏹
+        </button>
       </div>
       <div class="timecode">{formattedTime}</div>
       <div class="spacer"></div>
@@ -98,32 +141,31 @@
         <span>zoom</span>
         <input type="range" min="10" max="200" bind:value={pxPerSecond} />
       </div>
-      <div class="ipc">{ipcMsg}</div>
+      <div class="ipc">{durationMs > 0 ? `${(durationMs / 1000).toFixed(1)}s` : ""}</div>
     </div>
 
     <div class="body">
       <div class="headers">
         <div class="ruler-corner"></div>
-        {#each laneNames as name}
+        {#each ["V2", "V1", "A1"] as name}
           <div class="track-header">{name}</div>
         {/each}
       </div>
 
       <div class="lanes-scroll" bind:this={lanesEl}>
-        <div class="lanes-inner" style="width: {totalSeconds * pxPerSecond}px">
-          <!-- svelte-ignore a11y_click_events_have_key_events -->
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <div
-            class="ruler"
-            onclick={onRulerClick}
-            onkeydown={onRulerKey}
-            role="slider"
-            tabindex="0"
-            aria-label="Timeline ruler"
-            aria-valuenow={playheadSeconds}
-            aria-valuemin="0"
-            aria-valuemax={totalSeconds}
-          >
+        <!-- Dragging is captured at the whole timeline area, not just the ruler -->
+        <div
+          class="lanes-inner"
+          style="width: {totalSeconds * pxPerSecond}px"
+          onpointerdown={beginDrag}
+          role="slider"
+          tabindex="0"
+          aria-label="Timeline"
+          aria-valuenow={positionMs / 1000}
+          aria-valuemin="0"
+          aria-valuemax={totalSeconds}
+        >
+          <div class="ruler">
             {#each ticks as t}
               <div class="tick" style="left: {t * pxPerSecond}px">
                 <div class="tick-mark"></div>
@@ -132,32 +174,11 @@
             {/each}
           </div>
 
-          {#each laneNames as _, laneIdx}
-            <div class="lane">
-              {#each clips.filter((c) => c.lane === laneIdx) as clip}
-                <div
-                  class="clip clip-{clip.kind}"
-                  style="left: {clip.start * pxPerSecond}px;
-                         width: {clip.dur * pxPerSecond}px"
-                >
-                  {clip.label}
-                </div>
-              {/each}
-            </div>
+          {#each [0, 1, 2] as _}
+            <div class="lane"></div>
           {/each}
 
-          <div
-            class="playhead"
-            style="left: {playheadPx}px"
-            onpointerdown={startDrag}
-            onpointermove={movePlayhead}
-            onpointerup={endDrag}
-            role="slider"
-            aria-valuenow={playheadSeconds}
-            aria-valuemin="0"
-            aria-valuemax={totalSeconds}
-            tabindex="0"
-          >
+          <div class="playhead" style="left: {playheadPx}px">
             <div class="playhead-head"></div>
           </div>
         </div>
@@ -167,48 +188,22 @@
 </div>
 
 <style>
-  :global(html),
-  :global(body) {
-    background: transparent;
-    margin: 0;
-    padding: 0;
-    overflow: hidden;
-  }
-
   .timeline-root {
-    --bg-panel:    #2b2b2b;
-    --bg-header:   #3d3d3d;
-    --bg-widget:   #545454;
-    --text:        #e5e5e5;
-    --text-dim:    #a0a0a0;
-    --accent:      #4772b3;
-    --playhead:    #ff8c00;
-    --border:      #131313;
-    --bg-window:   #1d1d1d;
-    --clip-video:  #3a5a7a;
-    --clip-audio:  #2f5040;
-    --clip-effect: #6a4a7a;
-
-    font-family: -apple-system, "Inter", "Segoe UI", system-ui, sans-serif;
-    font-size: 13px;
-    color: var(--text);
-    background: transparent;
     width: 100%;
     height: 100vh;
     display: flex;
     flex-direction: column;
     user-select: none;
     overflow: hidden;
+    background: transparent;
   }
 
-  /* Top 600px: nothing drawn, wgpu subsurface shows through */
   .preview-spacer {
     flex: 1;
     min-height: 0;
     background: transparent;
   }
 
-  /* Bottom 300px: opaque UI */
   .ui-bottom {
     height: 300px;
     display: flex;
@@ -218,7 +213,7 @@
   }
 
   .toolbar {
-    height: 40px;
+    height: var(--toolbar-h);
     background: var(--bg-header);
     border-bottom: 1px solid var(--border);
     display: flex;
@@ -232,18 +227,18 @@
     background: var(--bg-widget);
     border: 1px solid var(--border);
     color: var(--text);
-    width: 28px;
+    min-width: 28px;
     height: 24px;
     border-radius: 3px;
     cursor: pointer;
     font-size: 11px;
     line-height: 1;
   }
-  .transport button:hover { background: #656565; }
+  .transport button:hover { background: var(--bg-hover); }
   .transport button:active { background: var(--accent); }
 
   .timecode {
-    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-family: var(--font-mono);
     font-size: 14px;
     color: var(--playhead);
     letter-spacing: 0.5px;
@@ -264,18 +259,18 @@
   }
 
   .headers {
-    width: 60px;
+    width: var(--track-header-w);
     background: var(--bg-panel);
     border-right: 1px solid var(--border);
     flex-shrink: 0;
   }
   .ruler-corner {
-    height: 24px;
+    height: var(--ruler-h);
     background: var(--bg-header);
     border-bottom: 1px solid var(--border);
   }
   .track-header {
-    height: 44px;
+    height: var(--track-h);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -295,18 +290,17 @@
   }
   .lanes-inner {
     position: relative;
-    height: 100%;
     min-height: 100%;
+    cursor: ew-resize;
   }
 
   .ruler {
-    height: 24px;
+    height: var(--ruler-h);
     background: var(--bg-header);
     border-bottom: 1px solid var(--border);
     position: relative;
-    cursor: crosshair;
   }
-  .tick { position: absolute; top: 0; height: 24px; }
+  .tick { position: absolute; top: 0; height: var(--ruler-h); }
   .tick-mark {
     width: 1px;
     height: 6px;
@@ -317,38 +311,17 @@
     position: absolute;
     top: 8px;
     left: 3px;
-    font-size: 10px;
+    font-size: var(--font-size-xs);
     color: var(--text-dim);
   }
 
   .lane {
-    height: 44px;
+    height: var(--track-h);
     border-bottom: 1px solid var(--border);
     position: relative;
     background: var(--bg-window);
   }
   .lane:nth-child(even) { background: #212121; }
-
-  .clip {
-    position: absolute;
-    top: 4px;
-    height: 36px;
-    border-radius: 3px;
-    padding: 0 8px;
-    display: flex;
-    align-items: center;
-    font-size: 11px;
-    color: var(--text);
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-    cursor: grab;
-    border: 1px solid rgba(0, 0, 0, 0.4);
-  }
-  .clip-video  { background: var(--clip-video); }
-  .clip-audio  { background: var(--clip-audio); }
-  .clip-effect { background: var(--clip-effect); }
-  .clip:hover  { filter: brightness(1.15); }
 
   .playhead {
     position: absolute;
@@ -356,16 +329,8 @@
     bottom: 0;
     width: 2px;
     background: var(--playhead);
-    cursor: ew-resize;
+    pointer-events: none;
     z-index: 10;
-  }
-  .playhead::before {
-    content: "";
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: -6px;
-    right: -6px;
   }
   .playhead-head {
     position: absolute;
