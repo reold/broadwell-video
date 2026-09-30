@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "preview",
+    "editor/src-tauri",
+]
+exclude = [
+    "archive",
+    "vendor/grafting",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+authors = ["reold"]
+
+[workspace.dependencies]
+anyhow = "1"
+libc = "0.2"
+dpi = "0.1"
+pollster = "0.4"
+raw-window-handle = "0.6"
+env_logger = "0.11"
+wgpu = "30"
+ffmpeg-sys-next = "8.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+grafting = { version = "0.6", default-features = false, features = ["wgpu-30"] }
+
+# The patched grafting crate at the workspace root. Applies to every member.
+[patch.crates-io]
+grafting = { path = "vendor/grafting" }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true

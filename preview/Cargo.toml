@@ -1,0 +1,23 @@
+[package]
+name = "hwa-preview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Standalone video preview (winit + wgpu)"
+
+[[bin]]
+name = "hwa-preview"
+path = "src/main.rs"
+
+[dependencies]
+hwa-core = { path = "../core" }
+anyhow.workspace = true
+libc.workspace = true
+dpi.workspace = true
+pollster.workspace = true
+env_logger.workspace = true
+wgpu.workspace = true
+ffmpeg-sys-next.workspace = true
+grafting.workspace = true
+winit = "0.30"

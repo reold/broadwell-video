@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Node
+**/node_modules/
+
+# SvelteKit
+**/.svelte-kit/
+**/build/
+
+# Editor scratch
+*.swp
+*.swo
+.DS_Store

@@ -1,0 +1,15 @@
+[package]
+name = "hwa-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared decode/grade/blit pipeline for HWA Video"
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+dpi.workspace = true
+wgpu.workspace = true
+ffmpeg-sys-next.workspace = true
+grafting.workspace = true
