@@ -7,7 +7,7 @@ use anyhow::Result;
 use ffmpeg_sys_next::*;
 use std::collections::HashMap;
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const MAX_CACHE_ENTRIES: usize = 64;
 
@@ -23,17 +23,11 @@ pub struct PreviewRenderer {
     pub host: grafting::HostWgpuContext,
     pub pipelines: gpu::Pipelines,
     pub texture_cache: HashMap<gpu::CacheKey, gpu::CachedNv12>,
-    pub frames: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
-    pub last_log: Instant,
 }
 
 impl PreviewRenderer {
-    /// Build the full preview pipeline for `video_path`.
-    ///
-    /// `surface_format` is the wgpu format of the target surface (used to
-    /// construct the blit pipeline). The host context is consumed.
     pub fn new(
         host: grafting::HostWgpuContext,
         video_path: &str,
@@ -51,18 +45,11 @@ impl PreviewRenderer {
             host,
             pipelines,
             texture_cache: HashMap::new(),
-            frames: 0,
             cache_hits: 0,
             cache_misses: 0,
-            last_log: Instant::now(),
         })
     }
 
-    /// Advance one frame and blit it into `surface`.
-    ///
-    /// The caller is responsible for calling `surface.present()` afterwards
-    /// if the surface backend requires it. In wgpu 30 the present happens
-    /// inside `queue.present()` which we call here.
     pub fn render_frame(
         &mut self,
         surface: &wgpu::Surface<'_>,
@@ -344,22 +331,6 @@ impl PreviewRenderer {
 
             drop(grade_bg);
             drop(blit_bg);
-        }
-
-        self.frames += 1;
-        if self.last_log.elapsed() >= Duration::from_secs(2) {
-            let secs = self.last_log.elapsed().as_secs_f64();
-            println!(
-                "preview {:.1} fps | cache h{} m{} sz{}",
-                self.frames as f64 / secs,
-                self.cache_hits,
-                self.cache_misses,
-                self.texture_cache.len(),
-            );
-            self.frames = 0;
-            self.cache_hits = 0;
-            self.cache_misses = 0;
-            self.last_log = Instant::now();
         }
 
         Ok(FrameOutcome::Processed)

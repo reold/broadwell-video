@@ -5,7 +5,11 @@ mod wayland_subsurface;
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
-use std::{ffi::c_void, ptr::NonNull};
+use std::{
+    ffi::c_void,
+    ptr::NonNull,
+    time::{Duration, Instant},
+};
 use tauri::Manager;
 use wayland_subsurface::WaylandSubsurface;
 
@@ -60,7 +64,6 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
                 }
             };
 
-        // Reserve the bottom 300 logical px for the timeline UI.
         let win_size = window.inner_size().unwrap_or(tauri::PhysicalSize {
             width: 1440,
             height: 900,
@@ -70,7 +73,6 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
         let preview_width = win_size.width.max(1);
         let preview_height = win_size.height.saturating_sub(ui_height_px).max(1);
 
-        // ---- Host context via grafting ----
         let device_desc = wgpu::DeviceDescriptor {
             label: Some("preview-device"),
             required_features: wgpu::Features::empty(),
@@ -120,7 +122,6 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
         let video_path = std::env::var("HWA_VIDEO")
             .unwrap_or_else(|_| "/home/reold/Downloads/jellyfish-15-mbps-hd-h264.mkv".into());
 
-        // ---- Shared preview renderer ----
         let mut renderer = match hwa_core::renderer::PreviewRenderer::new(host, &video_path, format)
         {
             Ok(r) => r,
@@ -130,10 +131,20 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
             }
         };
 
-        // ---- Main loop ----
+        // ---- Timing accumulators ----
+        let mut frames: u64 = 0;
+        let mut last_log = Instant::now();
+        let mut t_total = Duration::ZERO;
+        let mut t_resize = Duration::ZERO;
+        let mut t_render = Duration::ZERO;
+        let mut t_sleep = Duration::ZERO;
         let mut last_size = (config.width, config.height);
+
         loop {
-            // Handle window resize
+            let iter_start = Instant::now();
+
+            // ---- resize check ----
+            let t = Instant::now();
             if let Ok(sz) = window.inner_size() {
                 if sz.width > 0 && sz.height > 0 {
                     let new_w = sz.width;
@@ -146,7 +157,10 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
                     }
                 }
             }
+            t_resize += t.elapsed();
 
+            // ---- render ----
+            let t = Instant::now();
             match renderer.render_frame(&surface, &config) {
                 Ok(_) => {}
                 Err(e) => {
@@ -154,9 +168,44 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
                     break;
                 }
             }
+            t_render += t.elapsed();
 
-            // Pace to the source framerate.
-            std::thread::sleep(renderer.frame_period());
+            // ---- sleep to hit source framerate ----
+            let t = Instant::now();
+            let period = renderer.frame_period();
+            let elapsed = iter_start.elapsed();
+            if elapsed < period {
+                std::thread::sleep(period - elapsed);
+            }
+            t_sleep += t.elapsed();
+
+            t_total += iter_start.elapsed();
+            frames += 1;
+
+            if last_log.elapsed() >= Duration::from_secs(2) {
+                let n = frames as f64;
+                let secs = last_log.elapsed().as_secs_f64();
+                println!(
+                    "preview {:.1} fps (target {:.2}) | iter {:.2} ms | resize {:.2} render {:.2} sleep {:.2} | cache h{} m{} sz{}",
+                    n / secs,
+                    renderer.ff.fps,
+                    t_total.as_secs_f64() * 1000.0 / n,
+                    t_resize.as_secs_f64() * 1000.0 / n,
+                    t_render.as_secs_f64() * 1000.0 / n,
+                    t_sleep.as_secs_f64() * 1000.0 / n,
+                    renderer.cache_hits,
+                    renderer.cache_misses,
+                    renderer.texture_cache.len(),
+                );
+                frames = 0;
+                t_total = Duration::ZERO;
+                t_resize = Duration::ZERO;
+                t_render = Duration::ZERO;
+                t_sleep = Duration::ZERO;
+                renderer.cache_hits = 0;
+                renderer.cache_misses = 0;
+                last_log = Instant::now();
+            }
         }
     });
 }
