@@ -1983,6 +1983,7 @@ dependencies = [
  "gdk",
  "gdkwayland-sys",
  "glib",
+ "grafting",
  "gtk",
  "hwa-core",
  "pollster",

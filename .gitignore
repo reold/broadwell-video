@@ -13,3 +13,6 @@
 *.swp
 *.swo
 .DS_Store
+
+# Editor local settings
+.zed/

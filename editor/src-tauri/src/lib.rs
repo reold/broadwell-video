@@ -5,7 +5,7 @@ mod wayland_subsurface;
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
-use std::{ffi::c_void, ptr::NonNull, time::Duration};
+use std::{ffi::c_void, ptr::NonNull};
 use tauri::Manager;
 use wayland_subsurface::WaylandSubsurface;
 
@@ -14,7 +14,7 @@ fn greet(name: &str) -> String {
     format!("Hello, {name}! IPC works.")
 }
 
-fn spawn_renderer(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
+fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
     let display_ptr = subsurface.display_ptr();
     let surface_ptr = subsurface.surface_ptr();
 
@@ -60,22 +60,6 @@ fn spawn_renderer(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
                 }
             };
 
-        let (device, queue) =
-            match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("probe-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::default(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                trace: wgpu::Trace::Off,
-            })) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    eprintln!("request_device failed: {e:?}");
-                    return;
-                }
-            };
-
         // Reserve the bottom 300 logical px for the timeline UI.
         let win_size = window.inner_size().unwrap_or(tauri::PhysicalSize {
             width: 1440,
@@ -85,6 +69,24 @@ fn spawn_renderer(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
         let ui_height_px = (300.0 * scale) as u32;
         let preview_width = win_size.width.max(1);
         let preview_height = win_size.height.saturating_sub(ui_height_px).max(1);
+
+        // ---- Host context via grafting ----
+        let device_desc = wgpu::DeviceDescriptor {
+            label: Some("preview-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+        };
+        let host = match grafting::vulkan_dmabuf::create_dmabuf_host_context(&adapter, &device_desc)
+        {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("create_dmabuf_host_context failed: {e:?}");
+                return;
+            }
+        };
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -105,7 +107,7 @@ fn spawn_renderer(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
             desired_maximum_frame_latency: 2,
             color_space: wgpu::SurfaceColorSpace::Srgb,
         };
-        surface.configure(&device, &config);
+        surface.configure(&host.device, &config);
 
         println!(
             "wgpu on subsurface: {}x{} {:?} @ {:?}",
@@ -115,80 +117,46 @@ fn spawn_renderer(subsurface: WaylandSubsurface, window: tauri::WebviewWindow) {
             adapter.get_info().backend
         );
 
-        let mut t: f32 = 0.0;
-        let mut frame_count: u64 = 0;
+        let video_path = std::env::var("HWA_VIDEO")
+            .unwrap_or_else(|_| "/home/reold/Downloads/jellyfish-15-mbps-hd-h264.mkv".into());
 
+        // ---- Shared preview renderer ----
+        let mut renderer = match hwa_core::renderer::PreviewRenderer::new(host, &video_path, format)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("PreviewRenderer::new failed: {e:?}");
+                return;
+            }
+        };
+
+        // ---- Main loop ----
+        let mut last_size = (config.width, config.height);
         loop {
+            // Handle window resize
             if let Ok(sz) = window.inner_size() {
                 if sz.width > 0 && sz.height > 0 {
                     let new_w = sz.width;
                     let new_h = sz.height.saturating_sub(ui_height_px).max(1);
-                    if new_w != config.width || new_h != config.height {
+                    if (new_w, new_h) != last_size {
                         config.width = new_w;
                         config.height = new_h;
-                        surface.configure(&device, &config);
+                        surface.configure(&renderer.host.device, &config);
+                        last_size = (new_w, new_h);
                     }
                 }
             }
 
-            // Solid red base with a subtle brightness pulse so the frame
-            // updates are visibly happening. Replaced by the video blit later.
-            t += 0.016;
-            let pulse = (t.sin() * 0.1 + 0.9) as f64;
-            let clear = wgpu::Color {
-                r: pulse,
-                g: 0.0,
-                b: 0.0,
-                a: 1.0,
-            };
-
-            let frame = match surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(f) => f,
-                wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                    surface.configure(&device, &config);
-                    continue;
+            match renderer.render_frame(&surface, &config) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("render_frame error: {e:?}");
+                    break;
                 }
-                other => {
-                    eprintln!("surface acquire: {other:?}");
-                    std::thread::sleep(Duration::from_millis(16));
-                    continue;
-                }
-            };
-
-            let view = frame
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("clear-encoder"),
-            });
-            {
-                let _rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("clear-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(clear),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-            }
-            queue.submit([enc.finish()]);
-            queue.present(frame);
-
-            frame_count += 1;
-            if frame_count % 120 == 0 {
-                println!("wgpu frame {frame_count}");
             }
 
-            std::thread::sleep(Duration::from_millis(16));
+            // Pace to the source framerate.
+            std::thread::sleep(renderer.frame_period());
         }
     });
 }
@@ -216,7 +184,7 @@ pub fn run() {
                 }
             };
 
-            spawn_renderer(subsurface, window);
+            spawn_video(subsurface, window);
             Ok(())
         })
         .run(tauri::generate_context!())

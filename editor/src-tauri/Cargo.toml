@@ -23,6 +23,7 @@ serde_json.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
 raw-window-handle.workspace = true
+grafting.workspace = true
 
 gtk = "0.18"
 gdk = "0.18"
