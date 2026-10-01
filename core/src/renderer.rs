@@ -58,12 +58,19 @@ pub struct PreviewRenderer {
     last_seek: Option<Instant>,
     /// PTS of the frame currently on screen.
     last_presented_pts: Option<i64>,
-    /// Counters for the periodic log line.
+    /// Target the last presented frame was chasing, so a legitimate backwards
+    /// drag can be told apart from a picture that regressed against a forward
+    /// one.
+    last_target_ms: Option<i64>,
+    /// Counters and per-phase timings for the periodic log line.
     pub presents: u64,
     pub seeks: u64,
     pub rewinds: u64,
     pub lag_ms_total: i64,
     pub lag_samples: u64,
+    pub chase_time: Duration,
+    pub import_time: Duration,
+    pub present_time: Duration,
 }
 
 impl PreviewRenderer {
@@ -109,11 +116,15 @@ impl PreviewRenderer {
             last_pts: 0,
             last_seek: None,
             last_presented_pts: None,
+            last_target_ms: None,
             presents: 0,
             seeks: 0,
             rewinds: 0,
             lag_ms_total: 0,
             lag_samples: 0,
+            chase_time: Duration::ZERO,
+            import_time: Duration::ZERO,
+            present_time: Duration::ZERO,
         })
     }
 
@@ -183,6 +194,7 @@ impl PreviewRenderer {
         // Pruning all the way to the target in a single call is what made each
         // scrub update cost 15-26 ms.
         let deadline = Instant::now() + CHASE_BUDGET;
+        let t_chase = Instant::now();
 
         // ---- Decode, chasing the newest target within the budget ----
         unsafe {
@@ -250,8 +262,10 @@ impl PreviewRenderer {
                 self.lag_ms_total += (target - self.last_pts).abs();
                 self.lag_samples += 1;
             }
+            self.chase_time += t_chase.elapsed();
 
             // ---- Import the decoded NV12 frame ----
+            let t_import = Instant::now();
             (*self.ff.drm_frame).format = AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
             ffmpeg::check(
                 av_hwframe_map(
@@ -390,8 +404,10 @@ impl PreviewRenderer {
             };
 
             av_frame_unref(self.ff.drm_frame);
+            self.import_time += t_import.elapsed();
 
             // ---- acquire surface texture ----
+            let t_present = Instant::now();
             let frame = match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(f) => f,
                 wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -485,16 +501,19 @@ impl PreviewRenderer {
             self.host.queue.present(frame);
             self.presents += 1;
 
-            // A frame shown earlier than the one before it is the signature of
-            // the backward jump a needless re-seek causes. Should stay near zero
-            // while dragging in one direction.
-            if self
-                .last_presented_pts
-                .is_some_and(|prev| self.last_pts < prev)
+            // A frame shown earlier than the one before it is only a defect
+            // when the target itself moved forward; dragging backwards is
+            // supposed to rewind. This counts regressions, not rewinds.
+            let target = self.prune_to_ms.unwrap_or(self.last_pts);
+            if let (Some(prev_pts), Some(prev_target)) =
+                (self.last_presented_pts, self.last_target_ms)
             {
-                self.rewinds += 1;
+                if self.last_pts < prev_pts && target > prev_target {
+                    self.rewinds += 1;
+                }
             }
             self.last_presented_pts = Some(self.last_pts);
+            self.last_target_ms = Some(target);
 
             self.host
                 .device
@@ -503,6 +522,9 @@ impl PreviewRenderer {
                     timeout: None,
                 })
                 .ok();
+            // Includes the blocking poll, which is where a frame's latency
+            // actually goes if the CPU cannot run ahead of the GPU.
+            self.present_time += t_present.elapsed();
 
             drop(grade_bg);
             drop(blit_bg);
@@ -517,12 +539,17 @@ impl PreviewRenderer {
 
     /// Loop period for the caller's render loop.
     pub fn loop_period(&self) -> Duration {
+        loop_period_for(self.ff.frame_period(), self.is_scrubbing())
+    }
+
+    /// True while a target is outstanding or one arrived recently.
+    ///
+    /// The UI drives its own playhead during a drag, so the render loop uses
+    /// this to skip event emission that would otherwise block on the webview.
+    pub fn is_scrubbing(&self) -> bool {
         let playing = self.state.lock().unwrap().playing;
         let since_seek = self.last_seek.map(|t| t.elapsed());
-        loop_period_for(
-            self.ff.frame_period(),
-            wants_display_rate(self.prune_to_ms.is_some(), playing, since_seek),
-        )
+        wants_display_rate(self.prune_to_ms.is_some(), playing, since_seek)
     }
 }
 

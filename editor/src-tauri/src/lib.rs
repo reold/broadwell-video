@@ -9,6 +9,10 @@ use raw_window_handle::{
 use std::{
     ffi::c_void,
     ptr::NonNull,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tauri::{Emitter, Manager, State};
@@ -50,7 +54,23 @@ fn seek_to(state: State<'_, SharedState>, ms: i64) {
     s.position_ms = ms;
 }
 
-fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow, shared: SharedState) {
+/// Latest window size in physical pixels, published by the main thread.
+///
+/// The render loop used to call `window.inner_size()` every frame. That is a
+/// synchronous round trip into the GTK main loop, and that loop is busy
+/// compositing the webview, so it cost more than the frame itself did. Reading
+/// two atomics costs nothing.
+struct WindowSize {
+    w: AtomicU32,
+    h: AtomicU32,
+}
+
+fn spawn_video(
+    subsurface: WaylandSubsurface,
+    window: tauri::WebviewWindow,
+    shared: SharedState,
+    size: Arc<WindowSize>,
+) {
     let display_ptr = subsurface.display_ptr();
     let surface_ptr = subsurface.surface_ptr();
 
@@ -96,12 +116,15 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow, shar
                 }
             };
 
+        // One blocking read at startup is fine; the loop reads the atomics.
         let win_size = window.inner_size().unwrap_or(tauri::PhysicalSize {
             width: 1440,
             height: 900,
         });
-        let scale = window.scale_factor().unwrap_or(1.0);
-        let ui_height_px = (300.0 * scale) as u32;
+        size.w.store(win_size.width, Ordering::Relaxed);
+        size.h.store(win_size.height, Ordering::Relaxed);
+        let mut scale = window.scale_factor().unwrap_or(1.0);
+        let mut ui_height_px = (300.0 * scale) as u32;
         let preview_width = win_size.width.max(1);
         let preview_height = win_size.height.saturating_sub(ui_height_px).max(1);
 
@@ -164,31 +187,49 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow, shar
             };
 
         let mut frames: u64 = 0;
+        let mut active_frames: u64 = 0;
         let mut last_log = Instant::now();
         let mut t_total = Duration::ZERO;
         let mut t_render = Duration::ZERO;
         let mut last_emit = Instant::now();
+        let mut last_emit_key = (true, 0i64, 0i64);
         let mut last_size = (config.width, config.height);
+        let mut last_size_poll = Instant::now();
 
         loop {
             let iter_start = Instant::now();
 
-            if let Ok(sz) = window.inner_size() {
-                if sz.width > 0 && sz.height > 0 {
-                    let new_w = sz.width;
-                    let new_h = sz.height.saturating_sub(ui_height_px).max(1);
-                    if (new_w, new_h) != last_size {
-                        config.width = new_w;
-                        config.height = new_h;
-                        surface.configure(&renderer.host.device, &config);
-                        last_size = (new_w, new_h);
+            // Prefer the size the main thread publishes on resize events, and
+            // poll slowly as a fallback in case this compositor sends none.
+            if last_size_poll.elapsed() >= Duration::from_millis(500) {
+                if let Ok(sz) = window.inner_size() {
+                    if sz.width > 0 && sz.height > 0 {
+                        size.w.store(sz.width, Ordering::Relaxed);
+                        size.h.store(sz.height, Ordering::Relaxed);
                     }
+                }
+                scale = window.scale_factor().unwrap_or(scale);
+                ui_height_px = (300.0 * scale) as u32;
+                last_size_poll = Instant::now();
+            }
+
+            let win_w = size.w.load(Ordering::Relaxed);
+            let win_h = size.h.load(Ordering::Relaxed);
+            if win_w > 0 && win_h > 0 {
+                let new_w = win_w;
+                let new_h = win_h.saturating_sub(ui_height_px).max(1);
+                if (new_w, new_h) != last_size {
+                    config.width = new_w;
+                    config.height = new_h;
+                    surface.configure(&renderer.host.device, &config);
+                    last_size = (new_w, new_h);
                 }
             }
 
             let t = Instant::now();
             match renderer.render_frame(&surface, &config) {
-                Ok(_) => {}
+                Ok(hwa_core::renderer::FrameOutcome::Paused) => {}
+                Ok(_) => active_frames += 1,
                 Err(e) => {
                     eprintln!("render_frame error: {e:?}");
                     break;
@@ -196,9 +237,18 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow, shar
             }
             t_render += t.elapsed();
 
-            if last_emit.elapsed() >= Duration::from_millis(16) {
+            // Emitting crosses into the GTK main loop, so it blocks this thread
+            // until the webview can take it; at 60 Hz that cost more than the
+            // frame did. The UI does not need it mid-drag either, because the
+            // playhead follows the pointer locally. So: only when something
+            // actually changed, no faster than 20 Hz, and never while scrubbing.
+            if last_emit.elapsed() >= Duration::from_millis(50) && !renderer.is_scrubbing() {
                 let snap = renderer.state.lock().unwrap().snapshot();
-                let _ = window.emit("playhead_update", &snap);
+                let key = (snap.playing, snap.position_ms, snap.duration_ms);
+                if key != last_emit_key {
+                    let _ = window.emit("playhead_update", &snap);
+                    last_emit_key = key;
+                }
                 last_emit = Instant::now();
             }
 
@@ -213,23 +263,27 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow, shar
 
             if last_log.elapsed() >= Duration::from_secs(2) {
                 let n = frames as f64;
+                let active = active_frames.max(1) as f64;
                 let secs = last_log.elapsed().as_secs_f64();
                 let snap = renderer.state.lock().unwrap().snapshot();
-                let chase = if renderer.lag_samples > 0 {
+                let lag = if renderer.lag_samples > 0 {
                     renderer.lag_ms_total as f64 / renderer.lag_samples as f64
                 } else {
                     0.0
                 };
                 println!(
-                    "loop {:.1}/s | video {:.2} fps | iter {:.2} ms | render {:.2} | presents {:.1}/s seeks {:.1}/s rewinds {} | chase {:.0} ms | pos {} / {} | playing {} | cache h{} m{} sz{}",
+                    "loop {:.1}/s | video {:.2} fps | iter {:.2} ms | render {:.2} = chase {:.1} + import {:.1} + present {:.1} | presents {:.1}/s seeks {:.1}/s rewinds {} | lag {:.0} ms | pos {} / {} | playing {} | cache h{} m{} sz{}",
                     n / secs,
                     renderer.ff.fps,
                     t_total.as_secs_f64() * 1000.0 / n,
                     t_render.as_secs_f64() * 1000.0 / n,
+                    renderer.chase_time.as_secs_f64() * 1000.0 / active,
+                    renderer.import_time.as_secs_f64() * 1000.0 / active,
+                    renderer.present_time.as_secs_f64() * 1000.0 / active,
                     renderer.presents as f64 / secs,
                     renderer.seeks as f64 / secs,
                     renderer.rewinds,
-                    chase,
+                    lag,
                     snap.position_ms,
                     snap.duration_ms,
                     snap.playing,
@@ -238,6 +292,7 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow, shar
                     renderer.texture_cache.len(),
                 );
                 frames = 0;
+                active_frames = 0;
                 t_total = Duration::ZERO;
                 t_render = Duration::ZERO;
                 renderer.cache_hits = 0;
@@ -247,6 +302,9 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow, shar
                 renderer.rewinds = 0;
                 renderer.lag_ms_total = 0;
                 renderer.lag_samples = 0;
+                renderer.chase_time = Duration::ZERO;
+                renderer.import_time = Duration::ZERO;
+                renderer.present_time = Duration::ZERO;
                 last_log = Instant::now();
             }
         }
@@ -286,7 +344,25 @@ pub fn run() {
                 }
             };
 
-            spawn_video(subsurface, window, shared.clone());
+            // Publish the window size from here rather than letting the render
+            // thread ask for it every frame.
+            let size = Arc::new(WindowSize {
+                w: AtomicU32::new(0),
+                h: AtomicU32::new(0),
+            });
+            if let Ok(s) = window.inner_size() {
+                size.w.store(s.width, Ordering::Relaxed);
+                size.h.store(s.height, Ordering::Relaxed);
+            }
+            let size_for_events = size.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::Resized(resized) = event {
+                    size_for_events.w.store(resized.width, Ordering::Relaxed);
+                    size_for_events.h.store(resized.height, Ordering::Relaxed);
+                }
+            });
+
+            spawn_video(subsurface, window, shared.clone(), size);
             Ok(())
         })
         .run(tauri::generate_context!())
