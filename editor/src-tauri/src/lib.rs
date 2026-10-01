@@ -25,7 +25,7 @@ fn greet(name: &str) -> String {
 
 #[tauri::command]
 fn log_msg(msg: String) {
-    println!("[frontend] {msg}");
+    println!("[{}] [frontend] {msg}", hwa_core::wall_clock_stamp());
 }
 
 #[tauri::command]
@@ -335,7 +335,10 @@ fn spawn_video(
                             Ok(hwa_core::renderer::FrameOutcome::Eof) => {
                                 match renderer.finish_export() {
                                     Ok((frames, clean_exit)) => {
-                                        println!("export finished: {frames} frames -> {output}");
+                                        let stamp = hwa_core::wall_clock_stamp();
+                                        println!(
+                                            "[{stamp}] export finished: {frames} frames -> {output}"
+                                        );
                                         // The file is the source of truth, not
                                         // the exit status: iHD aborts during
                                         // teardown after the muxer has already
@@ -343,11 +346,11 @@ fn spawn_video(
                                         // with a non-zero exit.
                                         match hwa_core::export::count_output_frames(&output) {
                                             Some(in_file) if in_file >= frames => {
-                                                println!("export verified: {in_file} frames in the file");
+                                                println!("[{stamp}] export verified: {in_file} frames in the file");
                                                 if !clean_exit {
                                                     println!(
-                                                        "note: ffmpeg exited non-zero after writing a complete \
-                                                         file (known iHD teardown abort)"
+                                                        "[{stamp}] note: ffmpeg exited non-zero after writing a \\
+                                                         complete file (known iHD teardown abort)"
                                                     );
                                                 }
                                                 report_export(&renderer.state, ExportStage::Done, None);
@@ -355,10 +358,10 @@ fn spawn_video(
                                             Some(in_file) => {
                                                 let missing = frames.saturating_sub(in_file);
                                                 println!(
-                                                    "WARNING: wrote {frames} frames but the file holds {in_file}; \
-                                                     {missing} were lost, and every picture referencing one is \
-                                                     undecodable too. Set HWA_EXPORT_ENCODER=x264 to use the \
-                                                     software encoder."
+                                                    "[{stamp}] WARNING: wrote {frames} frames but the file holds \\
+                                                     {in_file}; {missing} were lost, and every picture referencing \\
+                                                     one is undecodable too. Set HWA_EXPORT_ENCODER=x264 to use \\
+                                                     the software encoder."
                                                 );
                                                 report_export(
                                                     &renderer.state,
@@ -499,7 +502,8 @@ fn spawn_video(
                     0.0
                 };
                 println!(
-                    "loop {:.1}/s | iter {:.2} ms | render {:.2} = chase {:.1} + map {:.1} + rest {:.1} + present {:.1} | map after-seek {:.1} (n{}) vs warm {:.1} (n{}) | presents {:.1}/s (ring {:.1}/s) seeks {:.1}/s | lag {:.0} ms | export grade {:.1} readback {:.1} write {:.1} | pos {} / {} | playing {} | cache h{} m{} sz{}",
+                    "[{}] loop {:.1}/s | iter {:.2} ms | render {:.2} = chase {:.1} + map {:.1} + rest {:.1} + present {:.1} | map after-seek {:.1} (n{}) vs warm {:.1} (n{}) | presents {:.1}/s (ring {:.1}/s) seeks {:.1}/s | lag {:.0} ms | export grade {:.1} readback {:.1} write {:.1} | pos {} / {} | playing {} | cache h{} m{} sz{}",
+                    hwa_core::wall_clock_stamp(),
                     n / secs,
                     t_total.as_secs_f64() * 1000.0 / n,
                     t_render.as_secs_f64() * 1000.0 / n,
@@ -523,10 +527,9 @@ fn spawn_video(
                     renderer.export_grade_time.as_secs_f64() * 1000.0 / active,
                     renderer.export_readback_time.as_secs_f64() * 1000.0 / active,
                     renderer.export_write_time.as_secs_f64() * 1000.0 / active,
-                    snap.position_ms,
-                    snap.duration_ms,
-                    snap.playing,
-                    renderer.cache_hits,
+                    hwa_core::timecode(snap.position_ms, renderer.ff.fps),
+                    hwa_core::timecode(snap.duration_ms, renderer.ff.fps),
+                    snap.playing,                    renderer.cache_hits,
                     renderer.cache_misses,
                     renderer.texture_cache.len(),
                 );

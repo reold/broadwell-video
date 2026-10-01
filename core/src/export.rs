@@ -124,6 +124,11 @@ pub fn readback_nv12(
         },
     );
     queue.submit([enc.finish()]);
+    // This poll is load-bearing, and that is measured rather than assumed:
+    // removing it and letting the map_async below carry the wait made the
+    // readback 16.9 ms -> 38 ms and the export 45.1 fps -> 24.1 fps. With the
+    // device already idle, map_async completes on the next poll; with work
+    // still in flight, wgpu pays for it twice.
     device
         .poll(wgpu::PollType::Wait {
             submission_index: None,
