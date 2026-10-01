@@ -14,6 +14,7 @@
 
 use anyhow::{Result, bail};
 use ffmpeg_sys_next::*;
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::ptr::null_mut;
@@ -58,8 +59,21 @@ pub struct VaapiEncoder {
     stream_index: i32,
     frames_written: u64,
     discarded: u64,
+    /// Frames sent to the encoder that it may still be holding.
+    ///
+    /// The VAAPI encoder works from surface ids, so releasing the AVFrame once
+    /// it has been sent can return its surface to the pool while a picture is
+    /// still queued. Measured with `async_depth=4`: fifty-eight packets for
+    /// sixty frames and twenty-nine decodable, against sixty and sixty at depth
+    /// 1 — which did not fix that so much as hide it by encoding strictly one
+    /// frame at a time, at 30.7 ms of send per frame. Holding a reference keeps
+    /// each surface out of the pool until the queue has moved past it.
+    handoff: VecDeque<*mut AVFrame>,
     finished: bool,
 }
+
+/// How many sent frames to keep alive. Comfortably more than `async_depth`.
+const HANDOFF_HOLD: usize = 8;
 
 fn describe(rc: i32) -> String {
     let mut buffer = [0i8; 256];
@@ -133,12 +147,23 @@ impl VaapiEncoder {
                 av_opt_set((*codec_ctx).priv_data, key.as_ptr(), mode.as_ptr(), 0);
                 let qp_key = CString::new("qp")?;
                 av_opt_set_int((*codec_ctx).priv_data, qp_key.as_ptr(), qp as i64, 0);
-                // One picture in flight. The default lets the encoder run a
-                // couple behind, and whatever is still queued when the stream is
-                // flushed came out as a filler packet flagged discard: a sixty
-                // frame export decoded fifty-nine, always missing the last one,
-                // deterministically. With this set there is nothing queued at
-                // flush time.
+                // One picture in flight, and that is a correctness requirement
+                // rather than a preference.
+                //
+                // Depth 4 loses pictures: fifty-eight packets for sixty frames
+                // and twenty-nine decodable, and still fifty-six of sixty with
+                // the handoff hold below holding surfaces out of the pool. The
+                // child process this replaced ran the same encoder at the same
+                // default depth and was complete, and the difference is where
+                // the pixels come from: it uploaded software frames with
+                // hwupload, while these surfaces are written by the render
+                // engine. Until that handover to the video engine is done
+                // properly -- grafting acquires the image from the foreign queue
+                // but nothing releases it back -- depth has to stay at one.
+                //
+                // The cost is real and measured: 30.7 ms of `send` per frame
+                // against 0.19 ms for the grade and its copies, which caps an
+                // export at roughly 32 fps. That is the next thing to fix.
                 let depth_key = CString::new("async_depth")?;
                 let rc = av_opt_set_int((*codec_ctx).priv_data, depth_key.as_ptr(), 1, 0);
                 if rc.is_negative() {
@@ -212,6 +237,7 @@ impl VaapiEncoder {
                 stream,
                 stream_index: (*stream).index,
                 discarded: 0,
+                handoff: VecDeque::new(),
                 frames_written: 0,
                 finished: false,
             })
@@ -278,6 +304,19 @@ impl VaapiEncoder {
                 avcodec_send_frame(self.codec, self.frame),
                 "send a graded frame to the encoder",
             )?;
+            // Keep this frame's surface out of the pool while the encoder may
+            // still be reading it. See the field comment.
+            let held = av_frame_alloc();
+            if held.is_null() {
+                bail!("av_frame_alloc for the handoff failed");
+            }
+            check(av_frame_ref(held, self.frame), "reference the sent frame")?;
+            self.handoff.push_back(held);
+            while self.handoff.len() > HANDOFF_HOLD {
+                if let Some(mut old) = self.handoff.pop_front() {
+                    av_frame_free(&mut old);
+                }
+            }
             // Counted before draining so the mux cap in `drain` knows how many
             // pictures belong to real frames.
             self.frames_written += 1;
@@ -375,6 +414,9 @@ impl VaapiEncoder {
 impl Drop for VaapiEncoder {
     fn drop(&mut self) {
         unsafe {
+            for mut held in self.handoff.drain(..) {
+                av_frame_free(&mut held);
+            }
             if !self.finished && !self.mux.is_null() {
                 // Best effort: a half-written file is better closed than left.
                 av_write_trailer(self.mux);
