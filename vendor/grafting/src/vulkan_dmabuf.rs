@@ -72,6 +72,10 @@ pub struct VulkanDmaBufImport {
     buffers: Vec<OwnedFd>,
     planes: Vec<VulkanDmaBufPlane>,
     queue_ownership: VulkanDmaBufQueueOwnership,
+    /// What the imported texture will be used for. The default suits reading a
+    /// frame someone else produced; an import that is going to be *written*
+    /// needs `COPY_DST` added, which is what `with_usage` is for.
+    usage: wgpu::TextureUses,
 }
 
 impl VulkanDmaBufImport {
@@ -95,7 +99,19 @@ impl VulkanDmaBufImport {
             buffers,
             planes,
             queue_ownership,
+            usage: wgpu::TextureUses::RESOURCE | wgpu::TextureUses::COPY_SRC,
         })
+    }
+
+    /// Request a different texture usage than the read-only default.
+    ///
+    /// An import that will be written on the GPU — the export direction, where
+    /// the picture is graded straight into a surface the encoder then reads —
+    /// needs [`wgpu::TextureUses::COPY_DST`] here, otherwise the copy into it
+    /// fails validation.
+    pub fn with_usage(mut self, usage: wgpu::TextureUses) -> Self {
+        self.usage = usage;
+        self
     }
 
     /// Construct an owned DMABUF import from raw descriptors.
@@ -256,6 +272,8 @@ pub fn import_dmabuf(
     frame: VulkanDmaBufImport,
     host: &HostWgpuContext,
 ) -> Result<wgpu::Texture, InteropError> {
+    // Read before `buffers` is moved out below.
+    let usage = frame.usage;
     let mut plane_fds = PlaneFdGuard::new(frame.buffers);
 
     if host.backend != crate::InteropBackend::Vulkan {
@@ -387,7 +405,7 @@ pub fn import_dmabuf(
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: frame.format,
-            usage: wgpu::TextureUses::RESOURCE | wgpu::TextureUses::COPY_SRC,
+            usage,
             memory_flags: wgpu_hal::MemoryFlags::empty(),
             view_formats: Vec::new(),
         };
@@ -418,12 +436,33 @@ pub fn import_dmabuf(
                 dimension: wgpu::TextureDimension::D2,
                 mip_level_count: 1,
                 sample_count: 1,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                usage: public_usage(usage),
                 view_formats: &[],
             },
             initial_state,
         ))
     }
+}
+
+/// The public usage flags that correspond to a set of hal texture uses.
+///
+/// wgpu validates the import against a `wgpu::TextureUsages` on the texture
+/// descriptor while the hal descriptor speaks `wgpu::TextureUses`, so both have
+/// to be set. Only the uses callers of this crate reach for are translated:
+/// reading a foreign frame (`RESOURCE | COPY_SRC`) and writing one
+/// (`+ COPY_DST`, which the export direction needs).
+fn public_usage(uses: wgpu::TextureUses) -> wgpu::TextureUsages {
+    let mut usage = wgpu::TextureUsages::empty();
+    if uses.contains(wgpu::TextureUses::RESOURCE) {
+        usage |= wgpu::TextureUsages::TEXTURE_BINDING;
+    }
+    if uses.contains(wgpu::TextureUses::COPY_SRC) {
+        usage |= wgpu::TextureUsages::COPY_SRC;
+    }
+    if uses.contains(wgpu::TextureUses::COPY_DST) {
+        usage |= wgpu::TextureUsages::COPY_DST;
+    }
+    usage
 }
 
 fn host_has_foreign_queue_support(host: &HostWgpuContext) -> bool {
