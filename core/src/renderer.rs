@@ -32,6 +32,17 @@ const SCRUB_PERIOD: Duration = Duration::from_millis(16);
 /// costs about 14 ms, which is what a seek costs anyway.
 const SEEK_AHEAD_MS: i64 = 1_500;
 
+/// Recent frames kept graded on the GPU so a scrub can be served without asking
+/// the decoder for anything.
+///
+/// Video cannot be decoded backwards, so every backward drag update used to
+/// seek, and a map that follows a seek costs 42-66 ms against 5.5-6.9 ms for a
+/// warm one. Caching what has already been decoded turns a backward drag into a
+/// lookup, which is the only way presentation keeps up at display rate.
+const RING_BUDGET_BYTES: u64 = 192 * 1024 * 1024;
+const RING_MIN_SLOTS: usize = 8;
+const RING_MAX_SLOTS: usize = 48;
+
 /// How long after the last seek the loop keeps running fast, so a brief pause
 /// mid-drag does not drop back to frame-rate pacing.
 const SCRUB_WINDOW: Duration = Duration::from_millis(400);
@@ -47,6 +58,15 @@ pub enum FrameOutcome {
 enum DecodeStep {
     Frame,
     Eof,
+}
+
+/// One graded frame held ready to present.
+struct RingSlot {
+    #[allow(dead_code)]
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    pts_ms: i64,
+    valid: bool,
 }
 
 pub struct PreviewRenderer {
@@ -86,6 +106,15 @@ pub struct PreviewRenderer {
     pub map_warm_count: u64,
     pub import_time: Duration,
     pub present_time: Duration,
+    /// Recently decoded frames, graded and ready to present.
+    ring: Vec<RingSlot>,
+    ring_next: usize,
+    /// Presents served from the ring, and frames decoded into it.
+    pub ring_presents: u64,
+    pub ring_decodes: u64,
+    /// Playback state last seen, so the decoder can be re-anchored when
+    /// scrubbing served from the ring has left it somewhere else.
+    was_playing: bool,
 }
 
 impl PreviewRenderer {
@@ -119,6 +148,36 @@ impl PreviewRenderer {
 
         let pipelines = gpu::build_pipelines(&host, surface_format, vw, vh);
 
+        // Graded frames kept resident for scrubbing, sized by budget so a 1080p
+        // clip does not hold half a gigabyte of them.
+        let frame_bytes = (vw as u64).max(1) * (vh as u64).max(1) * 4;
+        let ring = (0..ring_capacity(frame_bytes))
+            .map(|_| {
+                let texture = host.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("ring-slot"),
+                    size: wgpu::Extent3d {
+                        width: vw.max(1),
+                        height: vh.max(1),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                RingSlot {
+                    texture,
+                    view,
+                    pts_ms: 0,
+                    valid: false,
+                }
+            })
+            .collect();
+
         Ok(Self {
             ff,
             host,
@@ -145,6 +204,11 @@ impl PreviewRenderer {
             map_warm_count: 0,
             import_time: Duration::ZERO,
             present_time: Duration::ZERO,
+            ring,
+            ring_next: 0,
+            ring_presents: 0,
+            ring_decodes: 0,
+            was_playing: true,
         })
     }
 
@@ -206,6 +270,52 @@ impl PreviewRenderer {
             return Ok(FrameOutcome::Paused);
         }
 
+        // ---- A resident frame may already cover this target ----
+        //
+        // This is what makes a scrub track the pointer. Video cannot be
+        // decoded backwards, so every backward drag update otherwise seeks, and
+        // a map that follows a seek costs 42-66 ms against 5.5-6.9 ms warm.
+        // Serving the update from the ring needs neither a seek nor a map.
+        //
+        // Only while paused: during playback a seek has to move the decoder
+        // itself, not just the picture.
+        let mut seeked_this_call = false;
+        if !playing {
+            let pending = self.state.lock().unwrap().pending_seek_ms;
+            if let Some(target) = pending {
+                if let Some(slot) = self.cached_slot_for(target) {
+                    {
+                        let mut s = self.state.lock().unwrap();
+                        s.pending_seek_ms = None;
+                        s.position_ms = target;
+                    }
+                    self.last_seek = Some(Instant::now());
+                    let resident_pts = self.ring[slot].pts_ms;
+                    self.lag_ms_total += (resident_pts - target).abs();
+                    self.lag_samples += 1;
+                    if self.last_presented_pts != Some(resident_pts) {
+                        self.present_resident(slot, target, surface, config)?;
+                    }
+                    return Ok(FrameOutcome::Processed);
+                }
+            }
+        }
+
+        // Scrubbing served from the ring leaves the decoder wherever it was, so
+        // re-anchor it when playback resumes.
+        if playing && !self.was_playing {
+            let resume_ms = self.state.lock().unwrap().position_ms;
+            unsafe {
+                self.ff.seek_to_ms(resume_ms)?;
+            }
+            // The seek lands on a keyframe, so chase forward to the playhead
+            // rather than presenting the keyframe.
+            self.prune_to_ms = Some(resume_ms);
+            self.seeks += 1;
+            seeked_this_call = true;
+        }
+        self.was_playing = playing;
+
         // The seek and the decode that follows share one slice of the frame
         // budget; the import, grade and blit get the rest. Whatever the decoder
         // has reached when the budget runs out is what gets presented, so a drag
@@ -215,7 +325,6 @@ impl PreviewRenderer {
         // scrub update cost 15-26 ms.
         let deadline = Instant::now() + CHASE_BUDGET;
         let t_chase = Instant::now();
-        let mut seeked_this_call = false;
 
         // ---- Decode, chasing the newest target within the budget ----
         unsafe {
@@ -440,25 +549,102 @@ impl PreviewRenderer {
             av_frame_unref(self.ff.drm_frame);
             self.import_time += t_import.elapsed();
 
-            // ---- acquire surface texture ----
-            let t_present = Instant::now();
-            let frame = match surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(f) => f,
-                wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                    surface.configure(&self.host.device, config);
-                    return Ok(FrameOutcome::Skipped);
-                }
-                other => {
-                    eprintln!("surface acquire: {other:?}");
-                    return Ok(FrameOutcome::Skipped);
-                }
-            };
-            let surface_view = frame
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
+            // ---- grade into a resident slot and present it ----
+            // Grading into the ring, rather than a scratch texture, is what
+            // lets this frame be shown again later without going back to the
+            // decoder for it.
+            let slot = self.next_ring_slot();
+            let target = self.prune_to_ms.unwrap_or(self.last_pts);
+            let slot_view = self.ring[slot].view.clone();
+            self.present_view(
+                &slot_view,
+                Some((&y_view, &uv_view)),
+                self.last_pts,
+                target,
+                surface,
+                config,
+            )?;
+            self.ring[slot].pts_ms = self.last_pts;
+            self.ring[slot].valid = true;
+            self.ring_decodes += 1;
+        }
 
-            // ---- grade + blit ----
+        Ok(FrameOutcome::Processed)
+    }
+
+    /// Next ring slot to write, round-robin.
+    fn next_ring_slot(&mut self) -> usize {
+        let slot = self.ring_next;
+        self.ring_next = (self.ring_next + 1) % self.ring.len().max(1);
+        slot
+    }
+
+    /// Resident frame to show for `target`, if one is close enough that
+    /// decoding would have produced the same picture: within half a frame, the
+    /// stored frame *is* the nearest frame.
+    fn cached_slot_for(&self, target: i64) -> Option<usize> {
+        let tolerance = (self.ff.frame_period().as_millis() as i64 / 2).max(1);
+        let resident: Vec<(i64, bool)> =
+            self.ring.iter().map(|s| (s.pts_ms, s.valid)).collect();
+        nearest_resident(&resident, target)
+            .filter(|(_, delta)| delta.abs() <= tolerance)
+            .map(|(slot, _)| slot)
+    }
+
+    /// Present a frame already resident in the ring, with no decoder work at
+    /// all: no seek, no decode, no map.
+    fn present_resident(
+        &mut self,
+        slot: usize,
+        target_ms: i64,
+        surface: &wgpu::Surface<'_>,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> Result<()> {
+        let pts_ms = self.ring[slot].pts_ms;
+        let view = self.ring[slot].view.clone();
+        self.ring_presents += 1;
+        self.present_view(&view, None, pts_ms, target_ms, surface, config)
+    }
+
+    /// Grade `planes` into `source` when they are given, then blit `source` to
+    /// the surface and present it.
+    fn present_view(
+        &mut self,
+        source: &wgpu::TextureView,
+        planes: Option<(&wgpu::TextureView, &wgpu::TextureView)>,
+        pts_ms: i64,
+        target_ms: i64,
+        surface: &wgpu::Surface<'_>,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> Result<()> {
+        let t_present = Instant::now();
+        let vw = self.ff.width;
+        let vh = self.ff.height;
+
+        let frame = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) => f,
+            wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                surface.configure(&self.host.device, config);
+                return Ok(());
+            }
+            other => {
+                eprintln!("surface acquire: {other:?}");
+                return Ok(());
+            }
+        };
+        let surface_view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut enc =
+            self.host
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("frame-encoder"),
+                });
+
+        if let Some((y_view, uv_view)) = planes {
             let grade_bg = self
                 .host
                 .device
@@ -468,103 +654,88 @@ impl PreviewRenderer {
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&y_view),
+                            resource: wgpu::BindingResource::TextureView(y_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&uv_view),
+                            resource: wgpu::BindingResource::TextureView(uv_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&self.pipelines.out_view),
+                            resource: wgpu::BindingResource::TextureView(source),
                         },
                     ],
                 });
-
-            // ---- letterbox for the current surface size ----
-            // display_aspect() folds in non-square pixels, so anamorphic
-            // footage gets its bars in the right place.
-            self.pipelines.set_letterbox(
-                &self.host.queue,
-                self.ff.display_aspect(),
-                config.width,
-                config.height,
-            );
-
-            let blit_bg = self
-                .pipelines
-                .blit_bind_group(&self.host.device, &self.pipelines.out_view);
-
-            let mut enc =
-                self.host
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("frame-encoder"),
-                    });
-            {
-                let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("grade-pass"),
-                    timestamp_writes: None,
-                });
-                cp.set_pipeline(&self.pipelines.grade_pipeline);
-                cp.set_bind_group(0, &grade_bg, &[]);
-                cp.dispatch_workgroups(vw.div_ceil(8), vh.div_ceil(8), 1);
-            }
-            {
-                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("blit-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &surface_view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                rp.set_pipeline(&self.pipelines.blit_pipeline);
-                rp.set_bind_group(0, &blit_bg, &[]);
-                rp.draw(0..3, 0..1);
-            }
-            self.host.queue.submit([enc.finish()]);
-            self.host.queue.present(frame);
-            self.presents += 1;
-
-            // A frame shown earlier than the one before it is only a defect
-            // when the target itself moved forward; dragging backwards is
-            // supposed to rewind. This counts regressions, not rewinds.
-            let target = self.prune_to_ms.unwrap_or(self.last_pts);
-            if let (Some(prev_pts), Some(prev_target)) =
-                (self.last_presented_pts, self.last_target_ms)
-            {
-                if self.last_pts < prev_pts && target > prev_target {
-                    self.rewinds += 1;
-                }
-            }
-            self.last_presented_pts = Some(self.last_pts);
-            self.last_target_ms = Some(target);
-
-            self.host
-                .device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: None,
-                })
-                .ok();
-            // Includes the blocking poll, which is where a frame's latency
-            // actually goes if the CPU cannot run ahead of the GPU.
-            self.present_time += t_present.elapsed();
-
-            drop(grade_bg);
-            drop(blit_bg);
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("grade-pass"),
+                timestamp_writes: None,
+            });
+            cp.set_pipeline(&self.pipelines.grade_pipeline);
+            cp.set_bind_group(0, &grade_bg, &[]);
+            cp.dispatch_workgroups(vw.div_ceil(8), vh.div_ceil(8), 1);
         }
 
-        Ok(FrameOutcome::Processed)
+        // display_aspect() folds in non-square pixels, so anamorphic footage
+        // gets its bars in the right place.
+        self.pipelines.set_letterbox(
+            &self.host.queue,
+            self.ff.display_aspect(),
+            config.width,
+            config.height,
+        );
+
+        let blit_bg = self.pipelines.blit_bind_group(&self.host.device, source);
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("blit-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &surface_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&self.pipelines.blit_pipeline);
+            rp.set_bind_group(0, &blit_bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
+
+        self.host.queue.submit([enc.finish()]);
+        self.host.queue.present(frame);
+        self.presents += 1;
+
+        // A frame shown earlier than the one before it is only a defect when
+        // the target itself moved forward; dragging backwards is supposed to
+        // rewind. This counts regressions, not rewinds.
+        if let (Some(prev_pts), Some(prev_target)) =
+            (self.last_presented_pts, self.last_target_ms)
+        {
+            if pts_ms < prev_pts && target_ms > prev_target {
+                self.rewinds += 1;
+            }
+        }
+        self.last_presented_pts = Some(pts_ms);
+        self.last_target_ms = Some(target_ms);
+
+        self.host
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .ok();
+        // Includes the blocking poll, which is where a frame's latency actually
+        // goes if the CPU cannot run ahead of the GPU.
+        self.present_time += t_present.elapsed();
+
+        Ok(())
     }
 
     pub fn frame_period(&self) -> Duration {
@@ -618,6 +789,22 @@ fn wants_display_rate(
 fn needs_seek(current_ms: i64, target_ms: i64) -> bool {
     let delta = target_ms - current_ms;
     delta < 0 || delta > SEEK_AHEAD_MS
+}
+
+/// How many graded frames to keep resident for a given frame size.
+fn ring_capacity(frame_bytes: u64) -> usize {
+    ((RING_BUDGET_BYTES / frame_bytes.max(1)) as usize).clamp(RING_MIN_SLOTS, RING_MAX_SLOTS)
+}
+
+/// Nearest resident frame to `target` as (index, signed delta), ignoring slots
+/// that hold nothing.
+fn nearest_resident(resident: &[(i64, bool)], target: i64) -> Option<(usize, i64)> {
+    resident
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, valid))| *valid)
+        .map(|(slot, (pts, _))| (slot, *pts - target))
+        .min_by_key(|(_, delta)| delta.abs())
 }
 
 /// Frame-rate pacing is right for playback and wrong for scrubbing: sleeping to
@@ -701,5 +888,28 @@ mod tests {
         // Forwards past the point where decoding the gap beats seeking.
         assert!(needs_seek(5_000, 5_000 + SEEK_AHEAD_MS + 1));
         assert!(needs_seek(0, 30_000));
+    }
+
+    #[test]
+    fn the_ring_picks_the_nearest_resident_frame() {
+        let resident = [(0, true), (33, true), (66, false), (99, true)];
+        assert_eq!(nearest_resident(&resident, 30), Some((1, 3)));
+        assert_eq!(nearest_resident(&resident, 96), Some((3, 3)));
+        // Invalid slots are never chosen, even when they are closest.
+        assert_eq!(nearest_resident(&resident, 66), Some((1, -33)));
+        assert_eq!(nearest_resident(&[(0, false)], 0), None);
+        assert_eq!(nearest_resident(&[], 0), None);
+    }
+
+    #[test]
+    fn ring_capacity_stays_within_the_memory_budget() {
+        // 1080p RGBA8 is 8.29 MB a frame: a 192 MB budget is 24 of them.
+        let hd = ring_capacity(1920 * 1080 * 4);
+        assert_eq!(hd, 24);
+        assert!(hd as u64 * 1920 * 1080 * 4 <= RING_BUDGET_BYTES);
+        // Small frames are capped, and tiny ones do not go below the floor.
+        assert_eq!(ring_capacity(64 * 36 * 4), RING_MAX_SLOTS);
+        assert_eq!(ring_capacity(u64::MAX), RING_MIN_SLOTS);
+        assert_eq!(ring_capacity(0), RING_MAX_SLOTS);
     }
 }

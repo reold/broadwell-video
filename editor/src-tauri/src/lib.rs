@@ -284,7 +284,7 @@ fn spawn_video(
                     0.0
                 };
                 println!(
-                    "loop {:.1}/s | iter {:.2} ms | render {:.2} = chase {:.1} + map {:.1} + rest {:.1} + present {:.1} | map after-seek {:.1} (n{}) vs warm {:.1} (n{}) | presents {:.1}/s seeks {:.1}/s | lag {:.0} ms | pos {} / {} | playing {} | cache h{} m{} sz{}",
+                    "loop {:.1}/s | iter {:.2} ms | render {:.2} = chase {:.1} + map {:.1} + rest {:.1} + present {:.1} | map after-seek {:.1} (n{}) vs warm {:.1} (n{}) | presents {:.1}/s (ring {:.1}/s) seeks {:.1}/s | lag {:.0} ms | pos {} / {} | playing {} | cache h{} m{} sz{}",
                     n / secs,
                     t_total.as_secs_f64() * 1000.0 / n,
                     t_render.as_secs_f64() * 1000.0 / n,
@@ -302,6 +302,7 @@ fn spawn_video(
                     map_warm,
                     renderer.map_warm_count,
                     renderer.presents as f64 / secs,
+                    renderer.ring_presents as f64 / secs,
                     renderer.seeks as f64 / secs,
                     lag,
                     snap.position_ms,
@@ -318,6 +319,7 @@ fn spawn_video(
                 renderer.cache_hits = 0;
                 renderer.cache_misses = 0;
                 renderer.presents = 0;
+                renderer.ring_presents = 0;
                 renderer.seeks = 0;
                 renderer.rewinds = 0;
                 renderer.lag_ms_total = 0;
