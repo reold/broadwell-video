@@ -579,11 +579,11 @@ impl PreviewRenderer {
         slot
     }
 
-    /// Resident frame to show for `target`, if one is close enough that
-    /// decoding would have produced the same picture: within half a frame, the
-    /// stored frame *is* the nearest frame.
+    /// Resident frame to show for `target`, if one is close enough that showing
+    /// it beats going back to the decoder for the exact one.
     fn cached_slot_for(&self, target: i64) -> Option<usize> {
-        let tolerance = (self.ff.frame_period().as_millis() as i64 / 2).max(1);
+        let frame_ms = self.ff.frame_period().as_millis() as i64;
+        let tolerance = cache_tolerance_ms(frame_ms, self.last_target_ms == Some(target));
         let resident: Vec<(i64, bool)> =
             self.ring.iter().map(|s| (s.pts_ms, s.valid)).collect();
         nearest_resident(&resident, target)
@@ -807,6 +807,24 @@ fn nearest_resident(resident: &[(i64, bool)], target: i64) -> Option<(usize, i64
         .min_by_key(|(_, delta)| delta.abs())
 }
 
+/// How far a resident frame may be from the target and still be the frame to
+/// show, in milliseconds.
+///
+/// While the target is moving, a frame or two of slack is far better than
+/// missing the ring and paying a 25-44 ms map: the ring only holds frames that
+/// were stopped on, and a drag moves further between presents than half a frame
+/// of video, so a tight window misses on almost every update. Once the target
+/// settles the window tightens to half a frame, which forces a decode of the
+/// exact frame, so the picture the user comes to rest on is correct.
+fn cache_tolerance_ms(frame_ms: i64, settled: bool) -> i64 {
+    let frame_ms = frame_ms.max(1);
+    if settled {
+        (frame_ms / 2).max(1)
+    } else {
+        frame_ms * 2
+    }
+}
+
 /// Frame-rate pacing is right for playback and wrong for scrubbing: sleeping to
 /// the video's frame period capped scrub updates at the video frame rate, which
 /// is what made a 29.97 fps clip feel like single-digit updates per second.
@@ -899,6 +917,16 @@ mod tests {
         assert_eq!(nearest_resident(&resident, 66), Some((1, -33)));
         assert_eq!(nearest_resident(&[(0, false)], 0), None);
         assert_eq!(nearest_resident(&[], 0), None);
+    }
+
+    #[test]
+    fn a_moving_target_tolerates_more_drift_than_a_settled_one() {
+        // 30 fps: two frames of slack while dragging, half a frame at rest.
+        assert_eq!(cache_tolerance_ms(33, false), 66);
+        assert_eq!(cache_tolerance_ms(33, true), 16);
+        // Degenerate frame periods still yield a usable window.
+        assert_eq!(cache_tolerance_ms(0, true), 1);
+        assert_eq!(cache_tolerance_ms(1, true), 1);
     }
 
     #[test]
