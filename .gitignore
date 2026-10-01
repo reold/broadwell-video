@@ -14,5 +14,8 @@
 *.swo
 .DS_Store
 
+# Local run logs (tauri dev 2>&1 | tee run.log)
+*.log
+
 # Editor local settings
 .zed/
