@@ -197,13 +197,37 @@ impl Exporter {
         // slower but encodes every frame it is given, which makes it the
         // control in that experiment and a usable fallback if the hardware
         // encoder cannot be tamed.
-        let encoder = std::env::var("HWA_EXPORT_ENCODER").unwrap_or_else(|_| "vaapi".to_string());
-        let tail: Vec<String> = if encoder == "x264" {
-            ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-bf", "0", "-g", "60"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        } else {
+        // The hardware encoder is NOT the default, and that is a deliberate
+        // reversal of the plan this project was built around.
+        //
+        // Measured on this machine: `h264_vaapi` through the i965 driver drops
+        // input frames (0-27 per 900, and 0-3 per 900 even when the input is
+        // nothing but black frames piped straight into ffmpeg, so it is the
+        // encoder and not this pipeline), and with `-bf 0` each drop takes the
+        // rest of its GOP with it. It also sometimes dies outright:
+        //
+        //   i965_drv_video.c:3433: i965_MapBuffer2:
+        //   Assertion `coded_buffer_segment->base.buf' failed.
+        //
+        // which leaves an mp4 with no moov atom, i.e. an unplayable file. It is
+        // fast (26.8 fps end to end against libx264's 6.9) and it is the reason
+        // this project exists, but a fast broken export is worth less than a
+        // slow correct one. `HWA_EXPORT_ENCODER=vaapi` opts back in.
+        let encoder = std::env::var("HWA_EXPORT_ENCODER").unwrap_or_else(|_| "x264".to_string());
+        let preset = std::env::var("HWA_EXPORT_X264_PRESET")
+            .unwrap_or_else(|_| "veryfast".to_string());
+
+        // `HWA_EXPORT_GOP` trades bits for blast radius.
+        //
+        // The i965 hardware encoder on this machine drops an input frame now and
+        // then -- measured with nothing but black frames piped into ffmpeg, so
+        // it is the encoder and not this pipeline. With `-bf 0` there are no
+        // B-frames to reorder, so a dropped frame leaves every later picture in
+        // its GOP referencing a frame that never arrived, and the decoder emits
+        // nothing for them: one drop at `-g 60` cost 58 pictures in one run.
+        // Halving the GOP halves that, at the cost of more I-frames.
+        let gop = std::env::var("HWA_EXPORT_GOP").unwrap_or_else(|_| "30".to_string());
+        let mut tail: Vec<String> = if encoder == "vaapi" {
             [
                 "-vaapi_device",
                 "/dev/dri/renderD128",
@@ -217,13 +241,20 @@ impl Exporter {
                 "22",
                 "-bf",
                 "0",
-                "-g",
-                "60",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+        } else {
+            [
+                "-c:v", "libx264", "-preset", &preset, "-crf", "20", "-bf", "0",
             ]
             .iter()
             .map(|s| s.to_string())
             .collect()
         };
+        tail.push("-g".to_string());
+        tail.push(gop);
 
         let mut child = Command::new("ffmpeg")
             .args([
@@ -292,6 +323,32 @@ impl Exporter {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Count the video frames actually present in a finished file.
+///
+/// "The export ran" and "the export worked" are different claims, and on this
+/// machine they came apart: the hardware encoder can lose input frames without
+/// failing, and each loss takes the rest of its GOP with it. Counting what
+/// ended up in the container is the only honest check, and it costs one process
+/// spawn at the end of an export.
+pub fn count_output_frames(path: &str) -> Option<u64> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=nw=1:nk=1",
+            path,
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 #[cfg(test)]

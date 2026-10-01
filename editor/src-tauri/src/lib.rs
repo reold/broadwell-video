@@ -336,6 +336,23 @@ fn spawn_video(
                                 match renderer.finish_export() {
                                     Ok(frames) => {
                                         println!("export finished: {frames} frames -> {output}");
+                                        // Count what actually landed in the
+                                        // file rather than trusting that the
+                                        // process exited zero.
+                                        match hwa_core::export::count_output_frames(&output) {
+                                            Some(in_file) if in_file >= frames => {
+                                                println!("export verified: {in_file} frames in the file");
+                                            }
+                                            Some(in_file) => {
+                                                println!(
+                                                    "WARNING: wrote {frames} frames but the file holds {in_file}. \
+                                                     {} were dropped by the encoder, and every picture referencing \
+                                                     one is undecodable too. Set HWA_EXPORT_ENCODER=x264.",
+                                                    frames.saturating_sub(in_file)
+                                                );
+                                            }
+                                            None => println!("export verification skipped (ffprobe unavailable)"),
+                                        }
                                         report_export(&renderer.state, ExportStage::Done, None);
                                     }
                                     Err(e) => report_export(
