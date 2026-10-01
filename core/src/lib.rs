@@ -1,5 +1,6 @@
 //! Shared pipeline code for HWA Video.
 
+pub mod encoder;
 pub mod export;
 pub mod ffmpeg;
 pub mod gpu;
