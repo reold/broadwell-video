@@ -21,9 +21,16 @@ const CHASE_BUDGET: Duration = Duration::from_millis(6);
 const SCRUB_PERIOD: Duration = Duration::from_millis(16);
 
 /// Decode forward to the target rather than seeking while it is within this
-/// distance. Seeking is only worth its own cost, and its jump back to a
-/// keyframe, for gaps the decoder could not cover in a frame or two.
-const SEEK_AHEAD_MS: i64 = 500;
+/// distance.
+///
+/// Seeking is far more expensive than the decode it saves: a seek flushes the
+/// decoder, so the next `av_hwframe_map` has to re-sync a freshly restarted
+/// VA-API pipeline, and the log shows import time tracking seeks/s (9 ms at 2
+/// seeks/s, 35 ms at 19). A 500 ms threshold kept tripping on its own lag,
+/// because a decoder 400 ms behind a target that moved 150 ms reads as a
+/// 550 ms jump: seek, slower map, more lag, seek again. Decoding 1.5 s of video
+/// costs about 14 ms, which is what a seek costs anyway.
+const SEEK_AHEAD_MS: i64 = 1_500;
 
 /// How long after the last seek the loop keeps running fast, so a brief pause
 /// mid-drag does not drop back to frame-rate pacing.
@@ -69,6 +76,7 @@ pub struct PreviewRenderer {
     pub lag_ms_total: i64,
     pub lag_samples: u64,
     pub chase_time: Duration,
+    pub map_time: Duration,
     pub import_time: Duration,
     pub present_time: Duration,
 }
@@ -123,6 +131,7 @@ impl PreviewRenderer {
             lag_ms_total: 0,
             lag_samples: 0,
             chase_time: Duration::ZERO,
+            map_time: Duration::ZERO,
             import_time: Duration::ZERO,
             present_time: Duration::ZERO,
         })
@@ -267,6 +276,7 @@ impl PreviewRenderer {
             // ---- Import the decoded NV12 frame ----
             let t_import = Instant::now();
             (*self.ff.drm_frame).format = AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+            let t_map = Instant::now();
             ffmpeg::check(
                 av_hwframe_map(
                     self.ff.drm_frame,
@@ -275,6 +285,9 @@ impl PreviewRenderer {
                 ),
                 "av_hwframe_map",
             )?;
+            // Timed separately: this is the call that has to sync the video
+            // engine, and the log suggests it is what a seek makes expensive.
+            self.map_time += t_map.elapsed();
             av_frame_unref(self.ff.decoded);
 
             let desc = (*self.ff.drm_frame).data[0] as *const AVDRMFrameDescriptor;

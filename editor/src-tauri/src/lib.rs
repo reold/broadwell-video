@@ -272,12 +272,13 @@ fn spawn_video(
                     0.0
                 };
                 println!(
-                    "loop {:.1}/s | video {:.2} fps | iter {:.2} ms | render {:.2} = chase {:.1} + import {:.1} + present {:.1} | presents {:.1}/s seeks {:.1}/s rewinds {} | lag {:.0} ms | pos {} / {} | playing {} | cache h{} m{} sz{}",
+                    "loop {:.1}/s | video {:.2} fps | iter {:.2} ms | render {:.2} = chase {:.1} + map {:.1} + import {:.1} + present {:.1} | presents {:.1}/s seeks {:.1}/s rewinds {} | lag {:.0} ms | pos {} / {} | playing {} | cache h{} m{} sz{}",
                     n / secs,
                     renderer.ff.fps,
                     t_total.as_secs_f64() * 1000.0 / n,
                     t_render.as_secs_f64() * 1000.0 / n,
                     renderer.chase_time.as_secs_f64() * 1000.0 / active,
+                    renderer.map_time.as_secs_f64() * 1000.0 / active,
                     renderer.import_time.as_secs_f64() * 1000.0 / active,
                     renderer.present_time.as_secs_f64() * 1000.0 / active,
                     renderer.presents as f64 / secs,
@@ -303,6 +304,7 @@ fn spawn_video(
                 renderer.lag_ms_total = 0;
                 renderer.lag_samples = 0;
                 renderer.chase_time = Duration::ZERO;
+                renderer.map_time = Duration::ZERO;
                 renderer.import_time = Duration::ZERO;
                 renderer.present_time = Duration::ZERO;
                 last_log = Instant::now();
