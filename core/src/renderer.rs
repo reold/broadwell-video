@@ -112,6 +112,11 @@ pub struct PreviewRenderer {
     /// Presents served from the ring, and frames decoded into it.
     pub ring_presents: u64,
     pub ring_decodes: u64,
+    /// Set while exporting: frames are piped to ffmpeg instead of presented.
+    export: Option<crate::export::Exporter>,
+    readback_y: wgpu::Buffer,
+    readback_uv: wgpu::Buffer,
+    readback_layout: crate::export::Nv12Readback,
     /// Playback state last seen, so the decoder can be re-anchored when
     /// scrubbing served from the ring has left it somewhere else.
     was_playing: bool,
@@ -144,6 +149,7 @@ impl PreviewRenderer {
             let mut s = state.lock().unwrap();
             s.duration_ms = ff.duration_ms;
             s.fps = ff.fps;
+            s.video_path = video_path.to_string();
         }
 
         let pipelines = gpu::build_pipelines(&host, surface_format, vw, vh);
@@ -178,6 +184,22 @@ impl PreviewRenderer {
             })
             .collect();
 
+        // Buffers for reading a packed NV12 frame back out of the GPU during an
+        // export. Allocated once, because an export reads back a frame at a time.
+        let readback_layout = crate::export::Nv12Readback::new(vw, vh);
+        let readback_y = host.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("export-readback-y"),
+            size: readback_layout.y_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let readback_uv = host.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("export-readback-uv"),
+            size: readback_layout.uv_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
         Ok(Self {
             ff,
             host,
@@ -208,6 +230,10 @@ impl PreviewRenderer {
             ring_next: 0,
             ring_presents: 0,
             ring_decodes: 0,
+            export: None,
+            readback_y,
+            readback_uv,
+            readback_layout,
             was_playing: true,
         })
     }
@@ -266,9 +292,10 @@ impl PreviewRenderer {
             let s = self.state.lock().unwrap();
             (s.playing, s.pending_seek_ms.is_some())
         };
-        if !playing && !had_seek && self.prune_to_ms.is_none() {
+        if !playing && !had_seek && self.prune_to_ms.is_none() && self.export.is_none() {
             return Ok(FrameOutcome::Paused);
         }
+        let exporting = self.export.is_some();
 
         // ---- A resident frame may already cover this target ----
         //
@@ -280,7 +307,7 @@ impl PreviewRenderer {
         // Only while paused: during playback a seek has to move the decoder
         // itself, not just the picture.
         let mut seeked_this_call = false;
-        if !playing {
+        if !playing && !exporting {
             let pending = self.state.lock().unwrap().pending_seek_ms;
             if let Some(target) = pending {
                 if let Some(slot) = self.cached_slot_for(target) {
@@ -549,6 +576,13 @@ impl PreviewRenderer {
             av_frame_unref(self.ff.drm_frame);
             self.import_time += t_import.elapsed();
 
+            // While exporting, the frame goes to ffmpeg instead of the screen,
+            // through the packed grade the export path was built around.
+            if exporting {
+                self.export_packed(&y_view, &uv_view)?;
+                return Ok(FrameOutcome::Processed);
+            }
+
             // ---- grade into a resident slot and present it ----
             // Grading into the ring, rather than a scratch texture, is what
             // lets this frame be shown again later without going back to the
@@ -577,6 +611,156 @@ impl PreviewRenderer {
         let slot = self.ring_next;
         self.ring_next = (self.ring_next + 1) % self.ring.len().max(1);
         slot
+    }
+
+    fn ring_clear(&mut self) {
+        for slot in &mut self.ring {
+            slot.valid = false;
+        }
+        self.ring_next = 0;
+    }
+
+    pub fn is_exporting(&self) -> bool {
+        self.export.is_some()
+    }
+
+    /// Frames handed to ffmpeg by the running export.
+    pub fn export_frames(&self) -> u64 {
+        self.export.as_ref().map_or(0, |e| e.frames)
+    }
+
+    /// Begin an export. The decoder rewinds, so the file is written from its
+    /// first frame; drive it by calling `render_frame` until it returns `Eof`.
+    pub fn begin_export(&mut self, output: &str) -> Result<()> {
+        unsafe {
+            self.ff.rewind();
+        }
+        self.ring_clear();
+        self.prune_to_ms = None;
+        self.last_pts = 0;
+        self.export = Some(crate::export::Exporter::new(
+            self.ff.width,
+            self.ff.height,
+            self.ff.fps,
+            output,
+            crate::export::PixFmt::Nv12,
+        )?);
+        Ok(())
+    }
+
+    /// Close the pipe and wait for ffmpeg. Returns the frames written.
+    pub fn finish_export(&mut self) -> Result<u64> {
+        match self.export.take() {
+            Some(exporter) => exporter.finish(),
+            None => Ok(0),
+        }
+    }
+
+    /// Abandon an export, discarding the partial file.
+    pub fn cancel_export(&mut self) {
+        if let Some(exporter) = self.export.take() {
+            exporter.kill();
+        }
+    }
+
+    /// Grade the imported planes to packed NV12, read them back and hand the
+    /// frame to ffmpeg. Readback is a `memcpy` per plane because the grade wrote
+    /// the packing the encoder's raw-video input expects.
+    fn export_packed(
+        &mut self,
+        y_view: &wgpu::TextureView,
+        uv_view: &wgpu::TextureView,
+    ) -> Result<()> {
+        let vw = self.ff.width;
+        let vh = self.ff.height;
+        let uv_w = vw / 2;
+        let uv_h = vh / 2;
+
+        let bg_y = self
+            .host
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("grade-y-bg"),
+                layout: &self.pipelines.grade_y_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(uv_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.pipelines.out_y_view),
+                    },
+                ],
+            });
+        let bg_uv = self
+            .host
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("grade-uv-bg"),
+                layout: &self.pipelines.grade_uv_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(uv_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.pipelines.out_uv_view),
+                    },
+                ],
+            });
+
+        let mut enc = self
+            .host
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("export-grade"),
+            });
+        {
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("grade-y-pass"),
+                timestamp_writes: None,
+            });
+            cp.set_pipeline(&self.pipelines.grade_y_pipeline);
+            cp.set_bind_group(0, &bg_y, &[]);
+            cp.dispatch_workgroups(vw.div_ceil(8), vh.div_ceil(8), 1);
+        }
+        {
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("grade-uv-pass"),
+                timestamp_writes: None,
+            });
+            cp.set_pipeline(&self.pipelines.grade_uv_pipeline);
+            cp.set_bind_group(0, &bg_uv, &[]);
+            cp.dispatch_workgroups(uv_w.div_ceil(8), uv_h.div_ceil(8), 1);
+        }
+        self.host.queue.submit([enc.finish()]);
+
+        let nv12 = crate::export::readback_nv12(
+            &self.host.device,
+            &self.host.queue,
+            &self.pipelines.out_y_texture,
+            &self.pipelines.out_uv_texture,
+            &self.readback_y,
+            &self.readback_uv,
+            vw,
+            vh,
+            &self.readback_layout,
+        )?;
+
+        if let Some(exporter) = self.export.as_mut() {
+            exporter.write_frame(&nv12)?;
+        }
+        Ok(())
     }
 
     /// Resident frame to show for `target`, if one is close enough that showing

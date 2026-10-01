@@ -10,6 +10,26 @@
     fps: number;
   };
 
+  type ExportProgress = {
+    stage: "idle" | "running" | "done" | "failed" | "cancelled";
+    frames_done: number;
+    frames_total: number;
+    fps: number;
+    output: string;
+    error: string | null;
+  };
+
+  let exportPath = $state("");
+  let exportState = $state<ExportProgress | null>(null);
+  let exportError = $state("");
+
+  let exportRunning = $derived(exportState?.stage === "running");
+  let exportPercent = $derived(
+    exportState && exportState.frames_total > 0
+      ? Math.min(100, (exportState.frames_done / exportState.frames_total) * 100)
+      : 0
+  );
+
   let positionMs = $state(0);
   let durationMs = $state(60_000);
   let playing = $state(true);
@@ -51,6 +71,10 @@
       playing = s.playing;
     });
 
+    invoke<string>("default_export_path").then((p) => {
+      if (!exportPath) exportPath = p;
+    });
+
     const unlisten = listen<StateSnapshot>("playhead_update", (event) => {
       const s = event.payload;
       if (!dragging) {
@@ -60,10 +84,29 @@
       playing = s.playing;
     });
 
+    const unlistenExport = listen<ExportProgress>("export_progress", (event) => {
+      exportState = event.payload;
+      exportError = event.payload.error ?? "";
+    });
+
     return () => {
       unlisten.then((f) => f());
+      unlistenExport.then((f) => f());
     };
   });
+
+  function startExport() {
+    exportError = "";
+    // Errors come back as a rejected promise; a failure inside the export loop
+    // arrives on the progress event instead.
+    Promise.resolve(invoke("start_export", { output: exportPath })).catch((e) => {
+      exportError = String(e);
+    });
+  }
+
+  function cancelExport() {
+    Promise.resolve(invoke("cancel_export")).catch(() => {});
+  }
 
   function togglePlay() {
     invoke<boolean>("toggle_play").then((p) => (playing = p));
@@ -136,6 +179,37 @@
       </div>
       <div class="timecode">{formattedTime}</div>
       <div class="spacer"></div>
+      <div class="export">
+        <input
+          class="path"
+          type="text"
+          bind:value={exportPath}
+          disabled={exportRunning}
+          placeholder="output file"
+          aria-label="Export output path"
+        />
+        {#if exportRunning}
+          <button type="button" onclick={cancelExport}>Cancel</button>
+          <div class="bar" title="{exportPercent.toFixed(0)}%">
+            <div class="fill" style="width: {exportPercent}%"></div>
+          </div>
+          <span class="progress">
+            {exportState?.frames_done ?? 0}{exportState && exportState.frames_total > 0
+              ? `/${exportState.frames_total}`
+              : ""}
+            · {(exportState?.fps ?? 0).toFixed(1)} fps
+          </span>
+        {:else}
+          <button type="button" onclick={startExport} disabled={!exportPath}>Export</button>
+          {#if exportState?.stage === "done"}
+            <span class="ok" title={exportState.output}>saved {exportState.frames_done}</span>
+          {:else if exportState?.stage === "cancelled"}
+            <span class="warn">cancelled</span>
+          {:else if exportError}
+            <span class="err" title={exportError}>failed</span>
+          {/if}
+        {/if}
+      </div>
       <div class="zoom">
         <span>zoom</span>
         <input type="range" min="10" max="200" bind:value={pxPerSecond} />
@@ -247,6 +321,45 @@
 
   .zoom { display: flex; align-items: center; gap: 8px; color: var(--text-dim); }
   .zoom input[type="range"] { width: 120px; accent-color: var(--accent); }
+
+  .export { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .export .path {
+    background: var(--bg-window);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
+    padding: 3px 6px;
+    border-radius: 3px;
+    width: 260px;
+    min-width: 0;
+  }
+  .export .path:disabled { color: var(--text-dim); }
+  .export button {
+    background: var(--bg-widget);
+    border: 1px solid var(--border);
+    color: var(--text);
+    height: 24px;
+    padding: 0 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: var(--font-size-sm);
+  }
+  .export button:hover:not(:disabled) { background: var(--bg-hover); }
+  .export button:disabled { color: var(--text-muted); cursor: default; }
+  .export .bar {
+    width: 90px;
+    height: 8px;
+    background: var(--bg-window);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .export .fill { height: 100%; background: var(--accent); }
+  .export .progress { color: var(--text-dim); font-size: var(--font-size-xs); font-family: var(--font-mono); }
+  .export .ok { color: #7ac47a; font-size: var(--font-size-xs); }
+  .export .warn { color: var(--playhead); font-size: var(--font-size-xs); }
+  .export .err { color: #d97070; font-size: var(--font-size-xs); }
 
   .ipc { color: var(--text-dim); font-size: 12px; }
 

@@ -2,7 +2,7 @@ extern crate gdk_wayland_sys;
 
 mod wayland_subsurface;
 
-use hwa_core::state::{SharedState, new_shared};
+use hwa_core::state::{ExportJob, ExportStage, SharedState, new_shared};
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
@@ -52,6 +52,66 @@ fn seek_to(state: State<'_, SharedState>, ms: i64) {
     let mut s = state.lock().unwrap();
     s.pending_seek_ms = Some(ms);
     s.position_ms = ms;
+}
+
+/// Where an export would go if the user just hits the button: next to the clip
+/// being edited, with `-export` appended so the original is never overwritten.
+#[tauri::command]
+fn default_export_path(state: State<'_, SharedState>) -> String {
+    let s = state.lock().unwrap();
+    let source = std::path::Path::new(&s.video_path);
+    let stem = source
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "export".to_string());
+    let dir = source
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    dir.join(format!("{stem}-export.mp4")).to_string_lossy().into_owned()
+}
+
+#[tauri::command]
+fn start_export(state: State<'_, SharedState>, output: String) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    if s.export.as_ref().is_some_and(|job| job.is_running()) {
+        return Err("an export is already running".into());
+    }
+    if output.trim().is_empty() {
+        return Err("choose an output file first".into());
+    }
+    // The real frame count is whatever the decoder produces; this is only so
+    // the progress bar has a denominator.
+    let frames_total = ((s.duration_ms.max(0) as f64 / 1000.0) * s.fps).round() as u64;
+    s.export = Some(ExportJob {
+        output: output.trim().to_string(),
+        frames_done: 0,
+        frames_total,
+        fps: 0.0,
+        stage: ExportStage::Running,
+        error: None,
+        cancel: false,
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_export(state: State<'_, SharedState>) {
+    if let Some(job) = state.lock().unwrap().export.as_mut() {
+        job.cancel = true;
+    }
+}
+
+fn report_export(state: &SharedState, stage: ExportStage, error: Option<String>) {
+    if let Some(job) = state.lock().unwrap().export.as_mut() {
+        job.stage = stage;
+        job.error = error;
+    }
+}
+
+fn export_progress(state: &SharedState) -> Option<hwa_core::state::ExportProgress> {
+    state.lock().unwrap().export.as_ref().map(|job| job.progress())
 }
 
 /// Latest window size in physical pixels, published by the main thread.
@@ -195,6 +255,8 @@ fn spawn_video(
         let mut last_emit_key = (true, 0i64, 0i64);
         let mut last_size = (config.width, config.height);
         let mut last_size_poll = Instant::now();
+        let mut export_started = Instant::now();
+        let mut last_export_emit = Instant::now();
 
         loop {
             let iter_start = Instant::now();
@@ -226,33 +288,134 @@ fn spawn_video(
                 }
             }
 
-            let t = Instant::now();
-            match renderer.render_frame(&surface, &config) {
-                Ok(hwa_core::renderer::FrameOutcome::Paused) => {}
-                Ok(_) => active_frames += 1,
-                Err(e) => {
-                    eprintln!("render_frame error: {e:?}");
-                    break;
+            // ---- Export takes over the loop while one is running ----
+            //
+            // One frame per iteration, fed straight to the encoder instead of
+            // the surface, as fast as the GPU can grade and read it back.
+            let mut exporting_now = false;
+            {
+                let (wanted, output, cancel) = {
+                    let s = renderer.state.lock().unwrap();
+                    match s.export.as_ref() {
+                        Some(job) => (job.is_running(), job.output.clone(), job.cancel),
+                        None => (false, String::new(), false),
+                    }
+                };
+
+                if wanted {
+                    exporting_now = true;
+                    if !renderer.is_exporting() {
+                        match renderer.begin_export(&output) {
+                            Ok(()) => export_started = Instant::now(),
+                            Err(e) => {
+                                report_export(
+                                    &renderer.state,
+                                    ExportStage::Failed,
+                                    Some(format!("{e:?}")),
+                                );
+                                if let Some(p) = export_progress(&renderer.state) {
+                                    let _ = window.emit("export_progress", &p);
+                                }
+                                exporting_now = false;
+                            }
+                        }
+                    }
+                }
+
+                if exporting_now {
+                    if cancel {
+                        renderer.cancel_export();
+                        report_export(&renderer.state, ExportStage::Cancelled, None);
+                        if let Some(p) = export_progress(&renderer.state) {
+                            let _ = window.emit("export_progress", &p);
+                        }
+                    } else {
+                        match renderer.render_frame(&surface, &config) {
+                            Ok(hwa_core::renderer::FrameOutcome::Eof) => {
+                                match renderer.finish_export() {
+                                    Ok(frames) => {
+                                        println!("export finished: {frames} frames -> {output}");
+                                        report_export(&renderer.state, ExportStage::Done, None);
+                                    }
+                                    Err(e) => report_export(
+                                        &renderer.state,
+                                        ExportStage::Failed,
+                                        Some(format!("{e:?}")),
+                                    ),
+                                }
+                                if let Some(p) = export_progress(&renderer.state) {
+                                    let _ = window.emit("export_progress", &p);
+                                }
+                            }
+                            Ok(_) => {
+                                let frames = renderer.export_frames();
+                                let elapsed = export_started.elapsed().as_secs_f64().max(0.001);
+                                {
+                                    let mut s = renderer.state.lock().unwrap();
+                                    if let Some(job) = s.export.as_mut() {
+                                        job.frames_done = frames;
+                                        job.fps = frames as f64 / elapsed;
+                                    }
+                                }
+                                if last_export_emit.elapsed() >= Duration::from_millis(200) {
+                                    if let Some(p) = export_progress(&renderer.state) {
+                                        let _ = window.emit("export_progress", &p);
+                                    }
+                                    last_export_emit = Instant::now();
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("export frame failed: {e:?}");
+                                renderer.cancel_export();
+                                report_export(
+                                    &renderer.state,
+                                    ExportStage::Failed,
+                                    Some(format!("{e:?}")),
+                                );
+                                if let Some(p) = export_progress(&renderer.state) {
+                                    let _ = window.emit("export_progress", &p);
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            t_render += t.elapsed();
 
-            // Emitting crosses into the GTK main loop, so it blocks this thread
-            // until the webview can take it; at 60 Hz that cost more than the
-            // frame did. The UI does not need it mid-drag either, because the
-            // playhead follows the pointer locally. So: only when something
-            // actually changed, no faster than 20 Hz, and never while scrubbing.
-            if last_emit.elapsed() >= Duration::from_millis(50) && !renderer.is_scrubbing() {
-                let snap = renderer.state.lock().unwrap().snapshot();
-                let key = (snap.playing, snap.position_ms, snap.duration_ms);
-                if key != last_emit_key {
-                    let _ = window.emit("playhead_update", &snap);
-                    last_emit_key = key;
+            if !exporting_now {
+                let t = Instant::now();
+                match renderer.render_frame(&surface, &config) {
+                    Ok(hwa_core::renderer::FrameOutcome::Paused) => {}
+                    Ok(_) => active_frames += 1,
+                    Err(e) => {
+                        eprintln!("render_frame error: {e:?}");
+                        break;
+                    }
                 }
-                last_emit = Instant::now();
+                t_render += t.elapsed();
+
+                // Emitting crosses into the GTK main loop, so it blocks this thread
+                // until the webview can take it; at 60 Hz that cost more than the
+                // frame did. The UI does not need it mid-drag either, because the
+                // playhead follows the pointer locally. So: only when something
+                // actually changed, no faster than 20 Hz, and never while scrubbing.
+                if last_emit.elapsed() >= Duration::from_millis(50) && !renderer.is_scrubbing() {
+                    let snap = renderer.state.lock().unwrap().snapshot();
+                    let key = (snap.playing, snap.position_ms, snap.duration_ms);
+                    if key != last_emit_key {
+                        let _ = window.emit("playhead_update", &snap);
+                        last_emit_key = key;
+                    }
+                    last_emit = Instant::now();
+                }
             }
 
-            let period = renderer.loop_period();
+            let period = if exporting_now {
+                // No pacing while exporting: the encoder is the consumer, and
+                // back-pressure comes from its pipe.
+                Duration::ZERO
+            } else {
+                renderer.loop_period()
+            };
             let elapsed = iter_start.elapsed();
             if elapsed < period {
                 std::thread::sleep(period - elapsed);
@@ -352,6 +515,9 @@ pub fn run() {
             toggle_play,
             set_paused,
             seek_to,
+            default_export_path,
+            start_export,
+            cancel_export,
         ])
         .setup(move |app| {
             let window = app.get_webview_window("main").unwrap();
