@@ -668,6 +668,11 @@ impl PreviewRenderer {
             self.ff.height,
             self.ff.fps,
             22,
+            // One picture in flight. Depth two is clean for surfaces filled by
+            // an upload and loses a few frames per sixty when the render engine
+            // writes them, which is the handover back to the video engine that
+            // grafting does not implement; see the note on `async_depth`.
+            1,
         )?);
         self.export_path = Some(output.to_string());
         Ok(())

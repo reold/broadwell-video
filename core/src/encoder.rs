@@ -99,7 +99,14 @@ impl VaapiEncoder {
     /// `fps` is the *source* rate; it becomes the encoder's time base and the
     /// presentation timestamps, so a 29.97 clip keeps its duration rather than
     /// being stretched to 30.
-    pub fn new(path: &str, width: u32, height: u32, fps: f64, qp: i32) -> Result<Self> {
+    pub fn new(
+        path: &str,
+        width: u32,
+        height: u32,
+        fps: f64,
+        qp: i32,
+        async_depth: i32,
+    ) -> Result<Self> {
         unsafe {
             let device_name = CString::new("/dev/dri/renderD128")?;
             let mut device: *mut AVBufferRef = null_mut();
@@ -147,8 +154,11 @@ impl VaapiEncoder {
                 av_opt_set((*codec_ctx).priv_data, key.as_ptr(), mode.as_ptr(), 0);
                 let qp_key = CString::new("qp")?;
                 av_opt_set_int((*codec_ctx).priv_data, qp_key.as_ptr(), qp as i64, 0);
-                // One picture in flight, and that is a correctness requirement
-                // rather than a preference.
+                // One picture in flight for the editor, and that is a
+                // correctness requirement rather than a preference: depth above
+                // one loses pictures mid-stream, not at the flush, so the
+                // keepalive in `finish` cannot absorb it. Callers pass the depth
+                // so a test can demonstrate that.
                 //
                 // Depth 4 loses pictures: fifty-eight packets for sixty frames
                 // and twenty-nine decodable, and still fifty-six of sixty with
@@ -165,7 +175,7 @@ impl VaapiEncoder {
                 // against 0.19 ms for the grade and its copies, which caps an
                 // export at roughly 32 fps. That is the next thing to fix.
                 let depth_key = CString::new("async_depth")?;
-                let rc = av_opt_set_int((*codec_ctx).priv_data, depth_key.as_ptr(), 1, 0);
+                let rc = av_opt_set_int((*codec_ctx).priv_data, depth_key.as_ptr(), async_depth as i64, 0);
                 if rc.is_negative() {
                     bail!("this ffmpeg's h264_vaapi has no async_depth option: {}", describe(rc));
                 }
@@ -291,6 +301,20 @@ impl VaapiEncoder {
         }
     }
 
+    /// Fill the current surface from a software frame.
+    ///
+    /// Not how the editor works — it grades straight into the surface — but this
+    /// is what `hwupload` does inside the ffmpeg CLI, which makes it the control
+    /// when something about GPU-written surfaces is in question.
+    pub fn upload_from(&mut self, software: *mut AVFrame) -> Result<()> {
+        unsafe {
+            check(
+                av_hwframe_transfer_data(self.frame, software, 0),
+                "upload a software frame into the encoder surface",
+            )
+        }
+    }
+
     /// Send the surface filled by the GPU and mux whatever the encoder emits.
     pub fn write_frame(&mut self) -> Result<()> {
         unsafe {
@@ -340,12 +364,16 @@ impl VaapiEncoder {
                 // treating every negative return as "nothing ready".
                 check(rc, "receive an encoded packet")?;
                 if (*self.packet).flags & AV_PKT_FLAG_DISCARD as i32 != 0 {
-                    // The driver produced no coded buffer for this picture and
-                    // ffmpeg emitted a filler so the timeline keeps its shape.
-                    // There is nothing to mux; see `finish` for what absorbs it.
+                    // Counted, but not dropped. An earlier version skipped these
+                    // on the reading that a discard packet holds no picture. That
+                    // is wrong at pipeline depth above one: the first packet of
+                    // the file -- the IDR the whole first GOP references -- comes
+                    // back flagged discard, and skipping it left a stream whose
+                    // first decodable frame was the second IDR at pts 12000,
+                    // thirty frames into a sixty frame file. ffmpeg emits the
+                    // flag to keep the timeline's shape, and the container is
+                    // where the shape belongs.
                     self.discarded += 1;
-                    av_packet_unref(self.packet);
-                    continue;
                 }
                 (*self.packet).stream_index = self.stream_index;
                 av_packet_rescale_ts(
@@ -365,14 +393,11 @@ impl VaapiEncoder {
 
     /// Flush, write the trailer and report how many frames were encoded.
     ///
-    /// One throwaway picture is spent before the flush. The final picture handed
-    /// to this driver comes back as a filler packet flagged discard — ten runs
-    /// out of ten, sixty frames in and fifty-nine decodable, always the last one
-    /// — and it survives `async_depth=1` and a surface pool large enough that
-    /// nothing is reused, so it is neither queue depth nor surface lifetime.
-    /// Sending a duplicate of the last picture gives the driver something to
-    /// lose, and the filler is dropped in `drain`, leaving the caller's frames
-    /// whole in the file.
+    /// One throwaway picture is spent first, and at pipeline depth one it is
+    /// still needed: without it the final picture comes back as a filler instead
+    /// of a coded one and a sixty frame export decodes fifty-nine. The filler
+    /// that the duplicate produces is muxed like everything else and decodes to
+    /// nothing, which is cheaper than losing a real frame.
     pub fn finish(&mut self) -> Result<u64> {
         if self.finished {
             return Ok(self.frames_written);

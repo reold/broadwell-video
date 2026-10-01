@@ -117,7 +117,7 @@ fn the_packed_grade_reaches_the_encoder_surface() {
     let staging_uv = staging(geometry.uv_size, "staging-uv");
 
     let mut encoder =
-        VaapiEncoder::new(out.to_str().unwrap(), WIDTH, HEIGHT, 29.97, 22).expect("open encoder");
+        VaapiEncoder::new(out.to_str().unwrap(), WIDTH, HEIGHT, 29.97, 22, 1).expect("open encoder");
 
     for _ in 0..FRAMES {
         let surface = encoder.begin_frame().expect("surface");

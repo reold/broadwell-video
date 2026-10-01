@@ -19,7 +19,8 @@ const HEIGHT: u32 = 360;
 const FRAMES: u64 = 60;
 /// A mid grey, chosen so that a channel mix-up or a blank surface is obvious.
 const LUMA: u8 = 160;
-const CHROMA: u8 = 128;
+const CHROMA_U: u8 = 128;
+const CHROMA_V: u8 = 128;
 const ALIGN: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
 fn host() -> grafting::HostWgpuContext {
@@ -130,12 +131,12 @@ fn an_in_process_export_encodes_what_the_gpu_wrote() {
     std::fs::remove_file(out).ok();
 
     let y_plane = vec![LUMA; (WIDTH * HEIGHT) as usize];
-    let uv_plane: Vec<u8> = std::iter::repeat_n([CHROMA, CHROMA], (WIDTH * HEIGHT / 4) as usize)
+    let uv_plane: Vec<u8> = std::iter::repeat_n([CHROMA_U, CHROMA_V], (WIDTH * HEIGHT / 4) as usize)
         .flatten()
         .collect();
 
     let mut encoder =
-        VaapiEncoder::new(out.to_str().unwrap(), WIDTH, HEIGHT, 29.97, 22).expect("open encoder");
+        VaapiEncoder::new(out.to_str().unwrap(), WIDTH, HEIGHT, 29.97, 22, 1).expect("open encoder");
 
     for _ in 0..FRAMES {
         let surface = encoder.begin_frame().expect("surface");

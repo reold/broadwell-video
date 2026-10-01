@@ -150,7 +150,7 @@ fn in_process_export_throughput() {
     std::fs::create_dir_all("target").ok();
     std::fs::remove_file(out).ok();
     let mut encoder =
-        VaapiEncoder::new(out, vw, vh, fps, 22).expect("open the in-process encoder");
+        VaapiEncoder::new(out, vw, vh, fps, 22, 1).expect("open the in-process encoder");
 
     let mut decoder = Decoder {
         ff,
