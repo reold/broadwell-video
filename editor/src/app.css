@@ -46,6 +46,22 @@ html, body {
     font-family: var(--font-ui);
     font-size: var(--font-size);
     color: var(--text);
+
+    /* App chrome, not a document: dragging widgets must not select labels.
+       Both prefixes: WebKitGTK still wants the -webkit- form. */
+    -webkit-user-select: none;
+    user-select: none;
+    cursor: default;
+}
+
+/* Text stays selectable where the user types or needs to copy it. Add
+   class="selectable" to any panel whose text should be copyable. */
+input,
+textarea,
+[contenteditable],
+.selectable {
+    -webkit-user-select: text;
+    user-select: text;
 }
 
 button {
