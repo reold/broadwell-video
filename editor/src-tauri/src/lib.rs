@@ -330,6 +330,7 @@ fn spawn_video(
                             let _ = window.emit("export_progress", &p);
                         }
                     } else {
+                        let t = Instant::now();
                         match renderer.render_frame(&surface, &config) {
                             Ok(hwa_core::renderer::FrameOutcome::Eof) => {
                                 match renderer.finish_export() {
@@ -348,6 +349,7 @@ fn spawn_video(
                                 }
                             }
                             Ok(_) => {
+                                active_frames += 1;
                                 let frames = renderer.export_frames();
                                 let elapsed = export_started.elapsed().as_secs_f64().max(0.001);
                                 {
@@ -377,6 +379,7 @@ fn spawn_video(
                                 }
                             }
                         }
+                        t_render += t.elapsed();
                     }
                 }
             }
@@ -447,7 +450,7 @@ fn spawn_video(
                     0.0
                 };
                 println!(
-                    "loop {:.1}/s | iter {:.2} ms | render {:.2} = chase {:.1} + map {:.1} + rest {:.1} + present {:.1} | map after-seek {:.1} (n{}) vs warm {:.1} (n{}) | presents {:.1}/s (ring {:.1}/s) seeks {:.1}/s | lag {:.0} ms | pos {} / {} | playing {} | cache h{} m{} sz{}",
+                    "loop {:.1}/s | iter {:.2} ms | render {:.2} = chase {:.1} + map {:.1} + rest {:.1} + present {:.1} | map after-seek {:.1} (n{}) vs warm {:.1} (n{}) | presents {:.1}/s (ring {:.1}/s) seeks {:.1}/s | lag {:.0} ms | export grade {:.1} readback {:.1} write {:.1} | pos {} / {} | playing {} | cache h{} m{} sz{}",
                     n / secs,
                     t_total.as_secs_f64() * 1000.0 / n,
                     t_render.as_secs_f64() * 1000.0 / n,
@@ -468,6 +471,9 @@ fn spawn_video(
                     renderer.ring_presents as f64 / secs,
                     renderer.seeks as f64 / secs,
                     lag,
+                    renderer.export_grade_time.as_secs_f64() * 1000.0 / active,
+                    renderer.export_readback_time.as_secs_f64() * 1000.0 / active,
+                    renderer.export_write_time.as_secs_f64() * 1000.0 / active,
                     snap.position_ms,
                     snap.duration_ms,
                     snap.playing,
@@ -495,6 +501,9 @@ fn spawn_video(
                 renderer.map_warm_count = 0;
                 renderer.import_time = Duration::ZERO;
                 renderer.present_time = Duration::ZERO;
+                renderer.export_grade_time = Duration::ZERO;
+                renderer.export_readback_time = Duration::ZERO;
+                renderer.export_write_time = Duration::ZERO;
                 last_log = Instant::now();
             }
         }

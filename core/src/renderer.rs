@@ -106,6 +106,11 @@ pub struct PreviewRenderer {
     pub map_warm_count: u64,
     pub import_time: Duration,
     pub present_time: Duration,
+    /// Export phases, which are the whole cost of an export frame: the grade
+    /// passes, the readback and the blocking write into ffmpeg's pipe.
+    pub export_grade_time: Duration,
+    pub export_readback_time: Duration,
+    pub export_write_time: Duration,
     /// Recently decoded frames, graded and ready to present.
     ring: Vec<RingSlot>,
     ring_next: usize,
@@ -226,6 +231,9 @@ impl PreviewRenderer {
             map_warm_count: 0,
             import_time: Duration::ZERO,
             present_time: Duration::ZERO,
+            export_grade_time: Duration::ZERO,
+            export_readback_time: Duration::ZERO,
+            export_write_time: Duration::ZERO,
             ring,
             ring_next: 0,
             ring_presents: 0,
@@ -638,6 +646,13 @@ impl PreviewRenderer {
         self.ring_clear();
         self.prune_to_ms = None;
         self.last_pts = 0;
+        // A seek left over from moving the playhead would otherwise be picked up
+        // by the first export frame and start the file somewhere else.
+        {
+            let mut s = self.state.lock().unwrap();
+            s.pending_seek_ms = None;
+            s.position_ms = 0;
+        }
         self.export = Some(crate::export::Exporter::new(
             self.ff.width,
             self.ff.height,
@@ -725,6 +740,7 @@ impl PreviewRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("export-grade"),
             });
+        let t_grade = Instant::now();
         {
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("grade-y-pass"),
@@ -744,7 +760,9 @@ impl PreviewRenderer {
             cp.dispatch_workgroups(uv_w.div_ceil(8), uv_h.div_ceil(8), 1);
         }
         self.host.queue.submit([enc.finish()]);
+        self.export_grade_time += t_grade.elapsed();
 
+        let t_readback = Instant::now();
         let nv12 = crate::export::readback_nv12(
             &self.host.device,
             &self.host.queue,
@@ -756,10 +774,13 @@ impl PreviewRenderer {
             vh,
             &self.readback_layout,
         )?;
+        self.export_readback_time += t_readback.elapsed();
 
+        let t_write = Instant::now();
         if let Some(exporter) = self.export.as_mut() {
             exporter.write_frame(&nv12)?;
         }
+        self.export_write_time += t_write.elapsed();
         Ok(())
     }
 
