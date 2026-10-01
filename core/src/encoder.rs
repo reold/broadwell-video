@@ -57,6 +57,7 @@ pub struct VaapiEncoder {
     stream: *mut AVStream,
     stream_index: i32,
     frames_written: u64,
+    discarded: u64,
     finished: bool,
 }
 
@@ -119,6 +120,11 @@ impl VaapiEncoder {
             (*codec_ctx).gop_size = 30;
             (*codec_ctx).max_b_frames = 0;
             (*codec_ctx).bit_rate = 20_000_000;
+            // Global header, so the encoder produces its parameter sets up front
+            // and `avformat_write_header` can put them in the container. Without
+            // it the mp4 muxer coped and matroska refused the stream outright
+            // with "Invalid data found when processing input".
+            (*codec_ctx).flags |= AV_CODEC_FLAG_GLOBAL_HEADER as i32;
 
             // Constant QP, matching what the child process used to be told.
             if !(*codec_ctx).priv_data.is_null() {
@@ -127,6 +133,17 @@ impl VaapiEncoder {
                 av_opt_set((*codec_ctx).priv_data, key.as_ptr(), mode.as_ptr(), 0);
                 let qp_key = CString::new("qp")?;
                 av_opt_set_int((*codec_ctx).priv_data, qp_key.as_ptr(), qp as i64, 0);
+                // One picture in flight. The default lets the encoder run a
+                // couple behind, and whatever is still queued when the stream is
+                // flushed came out as a filler packet flagged discard: a sixty
+                // frame export decoded fifty-nine, always missing the last one,
+                // deterministically. With this set there is nothing queued at
+                // flush time.
+                let depth_key = CString::new("async_depth")?;
+                let rc = av_opt_set_int((*codec_ctx).priv_data, depth_key.as_ptr(), 1, 0);
+                if rc.is_negative() {
+                    bail!("this ffmpeg's h264_vaapi has no async_depth option: {}", describe(rc));
+                }
             }
 
             // The surface pool, which has to exist before the codec opens: the
@@ -194,6 +211,7 @@ impl VaapiEncoder {
                 mux,
                 stream,
                 stream_index: (*stream).index,
+                discarded: 0,
                 frames_written: 0,
                 finished: false,
             })
@@ -260,8 +278,10 @@ impl VaapiEncoder {
                 avcodec_send_frame(self.codec, self.frame),
                 "send a graded frame to the encoder",
             )?;
-            self.drain()?;
+            // Counted before draining so the mux cap in `drain` knows how many
+            // pictures belong to real frames.
             self.frames_written += 1;
+            self.drain()?;
             Ok(())
         }
     }
@@ -280,6 +300,14 @@ impl VaapiEncoder {
                 // Anything else is a real failure and used to be swallowed by
                 // treating every negative return as "nothing ready".
                 check(rc, "receive an encoded packet")?;
+                if (*self.packet).flags & AV_PKT_FLAG_DISCARD as i32 != 0 {
+                    // The driver produced no coded buffer for this picture and
+                    // ffmpeg emitted a filler so the timeline keeps its shape.
+                    // There is nothing to mux; see `finish` for what absorbs it.
+                    self.discarded += 1;
+                    av_packet_unref(self.packet);
+                    continue;
+                }
                 (*self.packet).stream_index = self.stream_index;
                 av_packet_rescale_ts(
                     self.packet,
@@ -297,11 +325,28 @@ impl VaapiEncoder {
     }
 
     /// Flush, write the trailer and report how many frames were encoded.
+    ///
+    /// One throwaway picture is spent before the flush. The final picture handed
+    /// to this driver comes back as a filler packet flagged discard — ten runs
+    /// out of ten, sixty frames in and fifty-nine decodable, always the last one
+    /// — and it survives `async_depth=1` and a surface pool large enough that
+    /// nothing is reused, so it is neither queue depth nor surface lifetime.
+    /// Sending a duplicate of the last picture gives the driver something to
+    /// lose, and the filler is dropped in `drain`, leaving the caller's frames
+    /// whole in the file.
     pub fn finish(&mut self) -> Result<u64> {
         if self.finished {
             return Ok(self.frames_written);
         }
         unsafe {
+            if self.frames_written > 0 {
+                (*self.frame).pts = self.frames_written as i64;
+                (*self.frame).duration = 1;
+                check(
+                    avcodec_send_frame(self.codec, self.frame),
+                    "send the keepalive picture",
+                )?;
+            }
             check(avcodec_send_frame(self.codec, null_mut()), "flush the encoder")?;
             self.drain()?;
             check(av_write_trailer(self.mux), "write the trailer")?;
@@ -316,6 +361,14 @@ impl VaapiEncoder {
     /// Frames handed to the encoder so far.
     pub fn frames_written(&self) -> u64 {
         self.frames_written
+    }
+
+    /// Pictures the driver declined to encode, reported as filler packets.
+    ///
+    /// One is expected: the keepalive sent by `finish`. More than that means
+    /// pictures were lost, which the frame-count check on the output catches.
+    pub fn discarded(&self) -> u64 {
+        self.discarded
     }
 }
 

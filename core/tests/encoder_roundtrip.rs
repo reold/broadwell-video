@@ -14,7 +14,9 @@ use wgpu::util::DeviceExt as _;
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 360;
-const FRAMES: u64 = 30;
+/// Long enough to force the surface pool to be reused several times, which is
+/// where the packet loss showed up first.
+const FRAMES: u64 = 60;
 /// A mid grey, chosen so that a channel mix-up or a blank surface is obvious.
 const LUMA: u8 = 160;
 const CHROMA: u8 = 128;
@@ -117,16 +119,9 @@ fn write_plane(
     host.queue.submit([enc.finish()]);
 }
 
-// Not yet passing. Everything above works except that the encoder emits a
-// filler packet (`AV_PKT_FLAG_DISCARD`) for the final frame, so a thirty-frame
-// export decodes twenty-nine, and sometimes one more goes with it (a run came
-// out 28 packets, 27 decodable). The same content and the same settings through
-// the ffmpeg CLI are clean three runs out of three, so the cause is in this
-// flow rather than in the encoder or the driver -- most likely the surface
-// lifetime described on `initial_pool_size` in `core/src/encoder.rs`. Run it
-// with `cargo test -p hwa-core --test encoder_roundtrip -- --ignored` to watch
-// it, and remove this attribute when it passes.
-#[ignore = "final frame arrives as a filler packet; see the comment above"]
+// Sixty frames, so the surface pool is exercised more than once, and the
+// content is checked as well as the count: a file with the right number of
+// frames of the wrong picture is not a working export.
 #[test]
 fn an_in_process_export_encodes_what_the_gpu_wrote() {
     let host = host();
