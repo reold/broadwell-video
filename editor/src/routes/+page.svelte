@@ -16,7 +16,6 @@
   let pxPerSecond = $state(40);
   let dragging = $state(false);
   let lanesEl: HTMLDivElement;
-  let lastSeekAt = 0;
 
   let playheadPx = $derived((positionMs / 1000) * pxPerSecond);
   let totalSeconds = $derived(durationMs / 1000);
@@ -76,7 +75,7 @@
     if (e.button !== 0) return;
     dragging = true;
     invoke("log_msg", { msg: `beginDrag clientX=${e.clientX}` });
-    seekFromPointer(e, true);
+    seekFromPointer(e);
 
     window.addEventListener("pointermove", onWindowPointerMove);
     window.addEventListener("pointerup", onWindowPointerUp);
@@ -84,7 +83,7 @@
 
   function onWindowPointerMove(e: PointerEvent) {
     if (!dragging) return;
-    seekFromPointer(e, false);
+    seekFromPointer(e);
   }
 
   function onWindowPointerUp(_e: PointerEvent) {
@@ -96,7 +95,7 @@
     invoke("seek_to", { ms: Math.round(positionMs) });
   }
 
-  function seekFromPointer(e: PointerEvent, immediate: boolean) {
+  function seekFromPointer(e: PointerEvent) {
     if (!lanesEl) {
       invoke("log_msg", { msg: "lanesEl is null" });
       return;
@@ -106,11 +105,11 @@
     const px = Math.max(0, Math.min(x, totalSeconds * pxPerSecond));
     positionMs = (px / pxPerSecond) * 1000;
 
-    const now = performance.now();
-    if (immediate || now - lastSeekAt > 120) {
-      lastSeekAt = now;
-      invoke("seek_to", { ms: Math.round(positionMs) });
-    }
+    // Deliberately unthrottled. The backend keeps only the newest target and
+    // services it once per loop iteration, so every pointer move can be sent
+    // without queueing work up; the old 120 ms throttle was what capped
+    // scrubbing at single-digit updates per second.
+    invoke("seek_to", { ms: Math.round(positionMs) });
   }
 </script>
 

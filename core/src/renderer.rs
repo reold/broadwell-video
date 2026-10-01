@@ -5,9 +5,21 @@ use anyhow::Result;
 use ffmpeg_sys_next::*;
 use std::collections::HashMap;
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_CACHE_ENTRIES: usize = 64;
+
+/// How long one `render_frame` call may spend seeking and decoding before it
+/// presents whatever it has reached. The rest of the frame budget belongs to
+/// the import, grade and blit.
+const CHASE_BUDGET: Duration = Duration::from_millis(6);
+
+/// The loop runs at display rate while a scrub is in flight.
+const SCRUB_PERIOD: Duration = Duration::from_millis(16);
+
+/// How long after the last seek the loop keeps running fast, so a brief pause
+/// mid-drag does not drop back to frame-rate pacing.
+const SCRUB_WINDOW: Duration = Duration::from_millis(400);
 
 #[derive(Clone, Copy, Debug)]
 pub enum FrameOutcome {
@@ -32,6 +44,15 @@ pub struct PreviewRenderer {
     pub cache_misses: u64,
     /// After a seek, decode frames until PTS >= this value before rendering.
     prune_to_ms: Option<i64>,
+    /// PTS of the last frame pulled out of the decoder.
+    last_pts: i64,
+    /// When the last seek was serviced, for loop pacing.
+    last_seek: Option<Instant>,
+    /// Counters for the periodic log line.
+    pub presents: u64,
+    pub seeks: u64,
+    pub lag_ms_total: i64,
+    pub lag_samples: u64,
 }
 
 impl PreviewRenderer {
@@ -74,6 +95,12 @@ impl PreviewRenderer {
             cache_hits: 0,
             cache_misses: 0,
             prune_to_ms: None,
+            last_pts: 0,
+            last_seek: None,
+            presents: 0,
+            seeks: 0,
+            lag_ms_total: 0,
+            lag_samples: 0,
         })
     }
 
@@ -131,52 +158,74 @@ impl PreviewRenderer {
             let s = self.state.lock().unwrap();
             (s.playing, s.pending_seek_ms.is_some())
         };
-        if !playing && !had_seek {
+        if !playing && !had_seek && self.prune_to_ms.is_none() {
             return Ok(FrameOutcome::Paused);
         }
 
-        // ---- Process any initial pending seek ----
-        if let Some(ms) = self.take_pending_seek() {
-            unsafe {
-                self.ff.seek_to_ms(ms)?;
-            }
-            self.prune_to_ms = Some(ms);
-        }
+        // The seek and the decode that follows share one slice of the frame
+        // budget; the import, grade and blit get the rest. Whatever the decoder
+        // has reached when the budget runs out is what gets presented, so a drag
+        // never blocks until a seek lands on its exact frame: the image trails
+        // the pointer by a frame or two and catches up over the next iterations.
+        // Pruning all the way to the target in a single call is what made each
+        // scrub update cost 15-26 ms.
+        let deadline = Instant::now() + CHASE_BUDGET;
 
-        // ---- Decode, pruning toward the target in one tight loop ----
-        //
-        // This is the fix for scrubbing: the loop runs to completion inside
-        // a single call, decoding as many frames as needed. Each iteration
-        // also re-checks for a *newer* seek so fast drags short-circuit.
+        // ---- Decode, chasing the newest target within the budget ----
         unsafe {
             loop {
                 if let Some(ms) = self.take_pending_seek() {
                     self.ff.seek_to_ms(ms)?;
                     self.prune_to_ms = Some(ms);
+                    self.seeks += 1;
+                    self.last_seek = Some(Instant::now());
                 }
 
                 match self.decode_step() {
                     DecodeStep::Frame => {}
                     DecodeStep::Eof => {
+                        if self.prune_to_ms.take().is_some() {
+                            // Dragged past the end of the file. Hold the last
+                            // frame rather than rewinding under a cursor that is
+                            // still moving.
+                            self.state.lock().unwrap().position_ms = self.last_pts;
+                            return Ok(FrameOutcome::Skipped);
+                        }
                         self.ff.rewind();
-                        self.prune_to_ms = None;
                         return Ok(FrameOutcome::Eof);
                     }
                 }
 
                 let pts = self.ff.current_pts_ms();
+                self.last_pts = pts;
 
-                if let Some(target) = self.prune_to_ms {
-                    if pts < target {
+                match self.prune_to_ms {
+                    Some(target) if pts < target => {
+                        if Instant::now() >= deadline {
+                            // Short of the target and out of budget: present
+                            // this frame and carry on from here next call.
+                            // position_ms stays at the target, so the playhead
+                            // shows the position that was asked for.
+                            break;
+                        }
                         av_frame_unref(self.ff.decoded);
                         continue;
                     }
-                    self.prune_to_ms = None;
+                    Some(_) => self.prune_to_ms = None,
+                    None => {}
                 }
 
                 // This is the frame we render.
                 self.state.lock().unwrap().position_ms = pts;
                 break;
+            }
+
+            // How far the frame being presented is from the position the user
+            // asked for. Only sampled while a target is outstanding, so it
+            // measures the scrub rather than diluting into playback.
+            if let Some(target) = self.prune_to_ms {
+                self.lag_ms_total += (target - self.last_pts).abs();
+                self.lag_samples += 1;
             }
 
             // ---- Import the decoded NV12 frame ----
@@ -411,6 +460,7 @@ impl PreviewRenderer {
             }
             self.host.queue.submit([enc.finish()]);
             self.host.queue.present(frame);
+            self.presents += 1;
 
             self.host
                 .device
@@ -429,5 +479,100 @@ impl PreviewRenderer {
 
     pub fn frame_period(&self) -> Duration {
         self.ff.frame_period()
+    }
+
+    /// Loop period for the caller's render loop.
+    pub fn loop_period(&self) -> Duration {
+        let playing = self.state.lock().unwrap().playing;
+        let since_seek = self.last_seek.map(|t| t.elapsed());
+        loop_period_for(
+            self.ff.frame_period(),
+            wants_display_rate(self.prune_to_ms.is_some(), playing, since_seek),
+        )
+    }
+}
+
+/// Whether the loop should run at display rate instead of the video frame rate.
+///
+/// An outstanding chase always wants display rate. The recent-seek window only
+/// applies while paused: during playback, pacing has to return to the video's
+/// frame rate the moment a chase lands, or the rest of the window would
+/// fast-forward the film at display rate.
+fn wants_display_rate(
+    target_outstanding: bool,
+    playing: bool,
+    since_seek: Option<Duration>,
+) -> bool {
+    if target_outstanding {
+        return true;
+    }
+    if playing {
+        return false;
+    }
+    since_seek.is_some_and(|elapsed| elapsed < SCRUB_WINDOW)
+}
+
+/// Frame-rate pacing is right for playback and wrong for scrubbing: sleeping to
+/// the video's frame period capped scrub updates at the video frame rate, which
+/// is what made a 29.97 fps clip feel like single-digit updates per second.
+fn loop_period_for(frame_period: Duration, display_rate: bool) -> Duration {
+    if display_rate {
+        frame_period.min(SCRUB_PERIOD)
+    } else {
+        frame_period
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FRAME_30: Duration = Duration::from_millis(33);
+
+    #[test]
+    fn scrub_pacing_does_not_inherit_the_video_frame_rate() {
+        assert_eq!(loop_period_for(FRAME_30, true), SCRUB_PERIOD);
+        // A faster-than-display source keeps its own period.
+        assert_eq!(
+            loop_period_for(Duration::from_millis(8), true),
+            Duration::from_millis(8)
+        );
+    }
+
+    #[test]
+    fn playback_pacing_follows_the_video() {
+        assert_eq!(loop_period_for(FRAME_30, false), FRAME_30);
+    }
+
+    #[test]
+    fn an_outstanding_chase_always_runs_at_display_rate() {
+        assert!(wants_display_rate(true, false, None));
+        assert!(wants_display_rate(true, true, None));
+    }
+
+    #[test]
+    fn a_recent_seek_keeps_a_paused_scrub_responsive() {
+        assert!(wants_display_rate(
+            false,
+            false,
+            Some(Duration::from_millis(50))
+        ));
+        // But not indefinitely.
+        assert!(!wants_display_rate(
+            false,
+            false,
+            Some(SCRUB_WINDOW + Duration::from_millis(1))
+        ));
+    }
+
+    #[test]
+    fn a_landed_chase_does_not_leave_playback_running_fast() {
+        // Otherwise the loop would present 60 frames per second of a 30 fps
+        // film for the rest of the window after every seek.
+        assert!(!wants_display_rate(
+            false,
+            true,
+            Some(Duration::from_millis(10))
+        ));
     }
 }

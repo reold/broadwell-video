@@ -43,7 +43,8 @@ fn set_paused(state: State<'_, SharedState>, paused: bool) {
 
 #[tauri::command]
 fn seek_to(state: State<'_, SharedState>, ms: i64) {
-    println!("[tauri] seek_to({ms})");
+    // Deliberately not logged: an unthrottled drag calls this on every pointer
+    // move. The periodic stats line reports the seek rate instead.
     let mut s = state.lock().unwrap();
     s.pending_seek_ms = Some(ms);
     s.position_ms = ms;
@@ -195,13 +196,13 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow, shar
             }
             t_render += t.elapsed();
 
-            if last_emit.elapsed() >= Duration::from_millis(50) {
+            if last_emit.elapsed() >= Duration::from_millis(16) {
                 let snap = renderer.state.lock().unwrap().snapshot();
                 let _ = window.emit("playhead_update", &snap);
                 last_emit = Instant::now();
             }
 
-            let period = renderer.frame_period();
+            let period = renderer.loop_period();
             let elapsed = iter_start.elapsed();
             if elapsed < period {
                 std::thread::sleep(period - elapsed);
@@ -214,12 +215,20 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow, shar
                 let n = frames as f64;
                 let secs = last_log.elapsed().as_secs_f64();
                 let snap = renderer.state.lock().unwrap().snapshot();
+                let chase = if renderer.lag_samples > 0 {
+                    renderer.lag_ms_total as f64 / renderer.lag_samples as f64
+                } else {
+                    0.0
+                };
                 println!(
-                    "preview {:.1} fps (target {:.2}) | iter {:.2} ms | render {:.2} | pos {} / {} ms | playing {} | cache h{} m{} sz{}",
+                    "loop {:.1}/s | video {:.2} fps | iter {:.2} ms | render {:.2} | presents {:.1}/s seeks {:.1}/s | chase {:.0} ms | pos {} / {} | playing {} | cache h{} m{} sz{}",
                     n / secs,
                     renderer.ff.fps,
                     t_total.as_secs_f64() * 1000.0 / n,
                     t_render.as_secs_f64() * 1000.0 / n,
+                    renderer.presents as f64 / secs,
+                    renderer.seeks as f64 / secs,
+                    chase,
                     snap.position_ms,
                     snap.duration_ms,
                     snap.playing,
@@ -232,6 +241,10 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow, shar
                 t_render = Duration::ZERO;
                 renderer.cache_hits = 0;
                 renderer.cache_misses = 0;
+                renderer.presents = 0;
+                renderer.seeks = 0;
+                renderer.lag_ms_total = 0;
+                renderer.lag_samples = 0;
                 last_log = Instant::now();
             }
         }
