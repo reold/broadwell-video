@@ -14,8 +14,16 @@ const MAX_CACHE_ENTRIES: usize = 64;
 /// the import, grade and blit.
 const CHASE_BUDGET: Duration = Duration::from_millis(6);
 
-/// The loop runs at display rate while a scrub is in flight.
+/// The loop runs at display rate while a scrub is in flight. Deliberately a
+/// touch faster than the panel's 60 Hz refresh: presenting slightly ahead of
+/// the display means a slow iteration drops into the next vblank rather than
+/// missing one and holding the same frame for two.
 const SCRUB_PERIOD: Duration = Duration::from_millis(16);
+
+/// Decode forward to the target rather than seeking while it is within this
+/// distance. Seeking is only worth its own cost, and its jump back to a
+/// keyframe, for gaps the decoder could not cover in a frame or two.
+const SEEK_AHEAD_MS: i64 = 500;
 
 /// How long after the last seek the loop keeps running fast, so a brief pause
 /// mid-drag does not drop back to frame-rate pacing.
@@ -48,9 +56,12 @@ pub struct PreviewRenderer {
     last_pts: i64,
     /// When the last seek was serviced, for loop pacing.
     last_seek: Option<Instant>,
+    /// PTS of the frame currently on screen.
+    last_presented_pts: Option<i64>,
     /// Counters for the periodic log line.
     pub presents: u64,
     pub seeks: u64,
+    pub rewinds: u64,
     pub lag_ms_total: i64,
     pub lag_samples: u64,
 }
@@ -97,8 +108,10 @@ impl PreviewRenderer {
             prune_to_ms: None,
             last_pts: 0,
             last_seek: None,
+            last_presented_pts: None,
             presents: 0,
             seeks: 0,
+            rewinds: 0,
             lag_ms_total: 0,
             lag_samples: 0,
         })
@@ -175,10 +188,20 @@ impl PreviewRenderer {
         unsafe {
             loop {
                 if let Some(ms) = self.take_pending_seek() {
-                    self.ff.seek_to_ms(ms)?;
-                    self.prune_to_ms = Some(ms);
-                    self.seeks += 1;
                     self.last_seek = Some(Instant::now());
+                    // A backward seek lands on the keyframe at or before the
+                    // target and then decodes forward, so re-seeking on every
+                    // drag update can present a frame *earlier* than the one
+                    // already on screen: the picture jumps back by up to a
+                    // whole GOP and then crawls forward again. That is the
+                    // visible stutter. Only seek when the target is behind the
+                    // decoder, or far enough ahead that decoding the gap would
+                    // cost more than the seek and its keyframe jump.
+                    if needs_seek(self.last_pts, ms) {
+                        self.ff.seek_to_ms(ms)?;
+                        self.seeks += 1;
+                    }
+                    self.prune_to_ms = Some(ms);
                 }
 
                 match self.decode_step() {
@@ -462,6 +485,17 @@ impl PreviewRenderer {
             self.host.queue.present(frame);
             self.presents += 1;
 
+            // A frame shown earlier than the one before it is the signature of
+            // the backward jump a needless re-seek causes. Should stay near zero
+            // while dragging in one direction.
+            if self
+                .last_presented_pts
+                .is_some_and(|prev| self.last_pts < prev)
+            {
+                self.rewinds += 1;
+            }
+            self.last_presented_pts = Some(self.last_pts);
+
             self.host
                 .device
                 .poll(wgpu::PollType::Wait {
@@ -510,6 +544,19 @@ fn wants_display_rate(
         return false;
     }
     since_seek.is_some_and(|elapsed| elapsed < SCRUB_WINDOW)
+}
+
+/// Whether chasing `target_ms` from `current_ms` needs a seek, or whether the
+/// decoder can simply carry on toward it.
+///
+/// Decoding forward is both cheaper and smoother than seeking for short
+/// distances: a seek resolves to the keyframe *before* the target and then
+/// decodes forward again, so seeking on every drag update can present a frame
+/// earlier than the one already on screen and make the picture jump backwards.
+/// That jump is the stutter this avoids.
+fn needs_seek(current_ms: i64, target_ms: i64) -> bool {
+    let delta = target_ms - current_ms;
+    delta < 0 || delta > SEEK_AHEAD_MS
 }
 
 /// Frame-rate pacing is right for playback and wrong for scrubbing: sleeping to
@@ -574,5 +621,24 @@ mod tests {
             true,
             Some(Duration::from_millis(10))
         ));
+    }
+
+    #[test]
+    fn short_forward_targets_decode_instead_of_seeking() {
+        // The anti-stutter rule: a drag that nudges forward must not re-seek,
+        // because the seek resolves to an earlier keyframe and the picture
+        // jumps backwards.
+        assert!(!needs_seek(5_000, 5_100));
+        assert!(!needs_seek(5_000, 5_000 + SEEK_AHEAD_MS));
+    }
+
+    #[test]
+    fn far_or_backward_targets_still_seek() {
+        // Backwards: there is no decoding backwards.
+        assert!(needs_seek(5_000, 4_900));
+        assert!(needs_seek(5_000, 0));
+        // Forwards past the point where decoding the gap beats seeking.
+        assert!(needs_seek(5_000, 5_000 + SEEK_AHEAD_MS + 1));
+        assert!(needs_seek(0, 30_000));
     }
 }

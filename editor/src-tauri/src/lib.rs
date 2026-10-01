@@ -221,13 +221,14 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow, shar
                     0.0
                 };
                 println!(
-                    "loop {:.1}/s | video {:.2} fps | iter {:.2} ms | render {:.2} | presents {:.1}/s seeks {:.1}/s | chase {:.0} ms | pos {} / {} | playing {} | cache h{} m{} sz{}",
+                    "loop {:.1}/s | video {:.2} fps | iter {:.2} ms | render {:.2} | presents {:.1}/s seeks {:.1}/s rewinds {} | chase {:.0} ms | pos {} / {} | playing {} | cache h{} m{} sz{}",
                     n / secs,
                     renderer.ff.fps,
                     t_total.as_secs_f64() * 1000.0 / n,
                     t_render.as_secs_f64() * 1000.0 / n,
                     renderer.presents as f64 / secs,
                     renderer.seeks as f64 / secs,
+                    renderer.rewinds,
                     chase,
                     snap.position_ms,
                     snap.duration_ms,
@@ -243,6 +244,7 @@ fn spawn_video(subsurface: WaylandSubsurface, window: tauri::WebviewWindow, shar
                 renderer.cache_misses = 0;
                 renderer.presents = 0;
                 renderer.seeks = 0;
+                renderer.rewinds = 0;
                 renderer.lag_ms_total = 0;
                 renderer.lag_samples = 0;
                 last_log = Instant::now();
