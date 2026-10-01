@@ -20,4 +20,5 @@ env_logger.workspace = true
 wgpu.workspace = true
 ffmpeg-sys-next.workspace = true
 grafting.workspace = true
+bytemuck.workspace = true
 winit = "0.30"

@@ -1969,10 +1969,13 @@ name = "hwa-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "dpi",
  "ffmpeg-sys-next",
  "grafting",
  "libc",
+ "naga",
+ "pollster",
  "serde",
  "wgpu",
 ]
@@ -2004,6 +2007,7 @@ name = "hwa-preview"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "dpi",
  "env_logger",
  "ffmpeg-sys-next",

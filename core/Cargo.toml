@@ -14,3 +14,8 @@ wgpu.workspace = true
 ffmpeg-sys-next.workspace = true
 grafting.workspace = true
 serde.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true
+naga = { version = "30", features = ["wgsl-in"] }

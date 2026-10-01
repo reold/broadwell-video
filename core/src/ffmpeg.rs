@@ -25,6 +25,9 @@ pub struct Handles {
     pub duration_ms: i64,
     pub time_base_num: i32,
     pub time_base_den: i32,
+    /// Sample aspect ratio (pixel shape) from the bitstream or the container.
+    pub sar_num: i32,
+    pub sar_den: i32,
 }
 
 impl Handles {
@@ -105,6 +108,23 @@ impl Handles {
                 "avcodec_open2",
             )?;
 
+            // Sample aspect ratio (pixel shape). The decoder fills this in from
+            // the H.264 VUI, the container may also carry it (MP4 pasp, MKV
+            // display dimensions). Prefer the most specific source, and fall
+            // back to square pixels when nobody declares one.
+            let mut sar = (*codec_ctx).sample_aspect_ratio;
+            if sar.num <= 0 || sar.den <= 0 {
+                sar = (*codecpar).sample_aspect_ratio;
+            }
+            if sar.num <= 0 || sar.den <= 0 {
+                sar = (*stream).sample_aspect_ratio;
+            }
+            let (sar_num, sar_den) = if sar.num > 0 && sar.den > 0 {
+                (sar.num, sar.den)
+            } else {
+                (1, 1)
+            };
+
             let packet = av_packet_alloc();
             let decoded = av_frame_alloc();
             let drm_frame = av_frame_alloc();
@@ -123,12 +143,19 @@ impl Handles {
                 duration_ms,
                 time_base_num,
                 time_base_den,
+                sar_num,
+                sar_den,
             })
         }
     }
 
     pub fn frame_period(&self) -> Duration {
         Duration::from_secs_f64(1.0 / self.fps)
+    }
+
+    /// Aspect ratio to letterbox against, including non-square pixels.
+    pub fn display_aspect(&self) -> f32 {
+        display_aspect(self.width, self.height, self.sar_num, self.sar_den)
     }
 
     pub unsafe fn rewind(&mut self) {
@@ -205,6 +232,21 @@ impl Drop for Handles {
             }
         }
     }
+}
+
+/// Display aspect ratio (width / height), honouring non-square pixels.
+///
+/// A non-positive `sar` means the stream declared none, so square pixels are
+/// assumed. Video is not always stored with square pixels: 720x480 NTSC is
+/// 16:9 for display when tagged SAR 32:27, and letterboxing it as 3:2 would
+/// put the bars in the wrong place.
+pub fn display_aspect(width: u32, height: u32, sar_num: i32, sar_den: i32) -> f32 {
+    let sar = if sar_num > 0 && sar_den > 0 {
+        sar_num as f32 / sar_den as f32
+    } else {
+        1.0
+    };
+    (width.max(1) as f32 / height.max(1) as f32) * sar
 }
 
 pub unsafe fn peek_video_info(path: &str) -> Result<(u32, u32, f64)> {

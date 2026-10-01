@@ -424,23 +424,17 @@ impl App {
             };
 
             // Blit from whichever texture holds the final result.
+            // Letterbox against this window's current size.
+            self.pipelines.set_letterbox(
+                &self.host.queue,
+                self.ff.display_aspect(),
+                self.surface_config.width,
+                self.surface_config.height,
+            );
+
             let blit_bg = self
-                .host
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("blit-bg-per-frame"),
-                    layout: &self.pipelines.blit_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Sampler(&self.pipelines.blit_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&blit_source_view),
-                        },
-                    ],
-                });
+                .pipelines
+                .blit_bind_group(&self.host.device, &blit_source_view);
 
             {
                 let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {

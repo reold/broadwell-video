@@ -48,6 +48,14 @@ impl PreviewRenderer {
             "Video: {vw}x{vh} @ {:.2} fps, duration {} ms",
             ff.fps, ff.duration_ms
         );
+        if (ff.sar_num, ff.sar_den) != (1, 1) {
+            println!(
+                "Non-square pixels: SAR {}/{} -> display aspect {:.4}",
+                ff.sar_num,
+                ff.sar_den,
+                ff.display_aspect()
+            );
+        }
 
         {
             let mut s = state.lock().unwrap();
@@ -351,23 +359,19 @@ impl PreviewRenderer {
                     ],
                 });
 
+            // ---- letterbox for the current surface size ----
+            // display_aspect() folds in non-square pixels, so anamorphic
+            // footage gets its bars in the right place.
+            self.pipelines.set_letterbox(
+                &self.host.queue,
+                self.ff.display_aspect(),
+                config.width,
+                config.height,
+            );
+
             let blit_bg = self
-                .host
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("blit-bg"),
-                    layout: &self.pipelines.blit_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Sampler(&self.pipelines.blit_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&self.pipelines.out_view),
-                        },
-                    ],
-                });
+                .pipelines
+                .blit_bind_group(&self.host.device, &self.pipelines.out_view);
 
             let mut enc =
                 self.host

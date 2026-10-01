@@ -32,6 +32,63 @@ pub struct Pipelines {
     #[allow(dead_code)]
     pub ping_b_texture: wgpu::Texture,
     pub ping_b_view: wgpu::TextureView,
+
+    /// Letterbox parameters: x = video aspect (w/h), y = target aspect (w/h).
+    pub blit_uniform: wgpu::Buffer,
+}
+
+/// Size of the `blit_uniform` contents: a single `vec4<f32>`.
+pub const BLIT_UNIFORM_SIZE: u64 = 16;
+
+/// `(video_aspect, target_aspect, 0, 0)` for `blit.wgsl`.
+///
+/// `video_aspect` is width / height and already folds in any non-square
+/// pixels (see `ffmpeg::display_aspect`).
+pub fn letterbox_params(video_aspect: f32, target_w: u32, target_h: u32) -> [f32; 4] {
+    let tw = target_w.max(1) as f32;
+    let th = target_h.max(1) as f32;
+    [video_aspect.max(0.000001), tw / th, 0.0, 0.0]
+}
+
+impl Pipelines {
+    /// Update the letterbox parameters. Call before submitting the frame.
+    pub fn set_letterbox(
+        &self,
+        queue: &wgpu::Queue,
+        video_aspect: f32,
+        target_w: u32,
+        target_h: u32,
+    ) {
+        let params = letterbox_params(video_aspect, target_w, target_h);
+        queue.write_buffer(&self.blit_uniform, 0, bytemuck::cast_slice(&params));
+    }
+
+    /// Bind `source` as the blit input, together with the letterbox uniform
+    /// (binding 2), so `set_letterbox` must have run for this frame.
+    pub fn blit_bind_group(
+        &self,
+        device: &wgpu::Device,
+        source: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit-bg"),
+            layout: &self.blit_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(source),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.blit_uniform.as_entire_binding(),
+                },
+            ],
+        })
+    }
 }
 
 fn make_yuv_grade_bgl(
@@ -267,6 +324,16 @@ pub fn build_pipelines(
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(BLIT_UNIFORM_SIZE),
+                },
+                count: None,
+            },
         ],
     });
     let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -307,6 +374,19 @@ pub fn build_pipelines(
         ..Default::default()
     });
 
+    // Letterbox parameters, rewritten every frame from the live surface size.
+    let blit_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("blit-uniform"),
+        size: BLIT_UNIFORM_SIZE,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    // Neutral default (no bars) so the uniform is never read uninitialised
+    // before the first `set_letterbox` call.
+    let neutral = letterbox_params(vw as f32 / vh.max(1) as f32, vw, vh);
+    host.queue
+        .write_buffer(&blit_uniform, 0, bytemuck::cast_slice(&neutral));
+
     Pipelines {
         grade_pipeline,
         grade_bgl,
@@ -323,6 +403,7 @@ pub fn build_pipelines(
         blit_pipeline,
         blit_bgl,
         blit_sampler,
+        blit_uniform,
         noop_pipeline,
         noop_bgl,
         ping_a_texture,
