@@ -214,8 +214,12 @@ impl Exporter {
         // this project exists, but a fast broken export is worth less than a
         // slow correct one. `HWA_EXPORT_ENCODER=vaapi` opts back in.
         let encoder = std::env::var("HWA_EXPORT_ENCODER").unwrap_or_else(|_| "x264".to_string());
+        // ultrafast because this is a two-core 15 W CPU and the export should
+        // finish: measured end to end on Jellyfish, 52.0 fps against veryfast's
+        // 21.9, both with every frame present. The cost is a larger file, which
+        // is what CRF is for; medium manages 6.9 fps.
         let preset = std::env::var("HWA_EXPORT_X264_PRESET")
-            .unwrap_or_else(|_| "veryfast".to_string());
+            .unwrap_or_else(|_| "ultrafast".to_string());
 
         // `HWA_EXPORT_GOP` trades bits for blast radius.
         //

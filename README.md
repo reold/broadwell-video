@@ -145,7 +145,8 @@ warp) need their own passes.
 | 1080p H.264 playback at source frame rate | works |
 | Aspect-correct letterbox, including non-square pixels | works |
 | Play / pause / seek / scrub over Tauri IPC | works |
-| Hardware `h264_vaapi` export | works from the editor's Export button and from the `hwa-preview` CLI |
+| Hardware `h264_vaapi` export | **unreliable on this driver — see below** |
+| Software export through libx264 | correct, and the default |
 | Scrubbing at display rate | in progress |
 | Audio | not started |
 | Effect chain | not started |
@@ -239,13 +240,95 @@ error}`. Shared state is `Arc<Mutex<EditorState>>`, registered with Tauri via
 The Export button hands the render loop to ffmpeg: each iteration decodes a
 frame, grades it through the packed export shaders (`grade_y.wgsl`,
 `grade_uv.wgsl` write 4 Y samples and 2 UV pairs per `R32Uint` texel, so the
-readback is a `memcpy` per plane), and pipes packed NV12 into a child process
-running `h264_vaapi`. Measured at 75–77 fps for 1080p and 126 fps at 720p.
+readback is a `memcpy` per plane), and pipes packed NV12 into a child process.
 
 The output path defaults to `<clip>-export.mp4` beside the source, so the button
 works without typing anything and cannot overwrite the original. The preview
 pane holds its last frame while an export runs; export takes priority over
 preview pacing, and back-pressure comes from ffmpeg's pipe rather than a sleep.
+
+### The hardware encoder on this machine cannot be trusted
+
+This is the one part of the pipeline the hardware does not deliver, and it took
+a frame count to see it. The original throughput figure — 75–77 fps for 1080p —
+was measured and is real:
+
+```
+proc 3.5 ms   rb 6.5 ms   pipe 2.6 ms   →  13 ms/frame
+```
+
+Less than 3 ms of that is the encoder waiting, so the encoder was never the
+throughput limit. What was never checked is whether the output was complete.
+It was not.
+
+| | written | packets muxed | decodable pictures |
+|---|---|---|---|
+| `hwa-preview` export, 1080p real content | 899 | 872 | **817** |
+| editor export, same file | 900 | 888 | **543** |
+| editor export, second attempt | 900 | 900 | 900 |
+| no decoder, no wgpu, no readback — 899 synthetic black frames straight into ffmpeg | 899 | 898 | **840** |
+
+The last row is the one that matters. With nothing of ours involved — no
+decoder, no grade, no readback, no pipeline — the encoder still dropped an input
+frame, and because `-bf 0` leaves no B-frames to reorder, every later picture in
+that GOP referenced a frame that never arrived and the decoder emitted nothing
+for them. **One dropped frame cost 58 pictures.**
+
+It also aborts outright. One run died on
+
+```
+i965_drv_video.c:3433: i965_MapBuffer2:
+Assertion `coded_buffer_segment->base.buf' failed.
+```
+
+which leaves an mp4 with no moov atom: an unplayable file rather than a lossy
+one. The drops are intermittent — one batch of nine runs at `-g 60` was clean
+eight times — but they never disappear.
+
+### What it means, and what the defaults are
+
+Broadwell has no VDENC and no HuC firmware: Gen8 uses the PAK + shader encoder,
+which runs motion estimation and macroblock kernels on the same 24 EUs as
+everything else, under a 15 W envelope, through a driver Intel archived in
+October 2024. Skylake and later have the low-power fixed-function encoder;
+Broadwell does not, and Intel's current iHD driver lists AVC *encode* as a
+Broxton-and-later feature, with Broadwell supported for decode only.
+
+So `libx264` is the default and `HWA_EXPORT_ENCODER=vaapi` opts back in. A fast
+broken export is worth less than a slow correct one.
+
+Measured end to end on the Jellyfish clip, 30 s of 1080p30, through this
+pipeline:
+
+| encoder | fps | frames written → decodable | size |
+|---|---|---|---|
+| `h264_vaapi` | 26.8 | 899 → **817** | 65 MB |
+| libx264 `ultrafast` | **52.0** | 899 → **899** | 90 MB |
+| libx264 `veryfast` | 21.9 | 899 → **899** | 55 MB |
+| libx264 `medium` | 6.9 | 899 → **899** | 56 MB |
+
+The software encoder is not a consolation prize here: at `ultrafast` it is
+**twice as fast as the hardware encoder** on this machine, and it is the only
+one that produces a complete file. Two cores are enough for 1080p30 when the
+preset is chosen for throughput rather than file size.
+
+| variable | default | why |
+|---|---|---|
+| `HWA_EXPORT_ENCODER` | `x264` | the hardware encoder loses frames and can abort |
+| `HWA_EXPORT_X264_PRESET` | `ultrafast` | 52 fps measured; `veryfast`/`medium` trade speed for size |
+| `HWA_EXPORT_GOP` | `30` | with `-bf 0` a drop costs up to one GOP; measured, 186 pictures lost at `-g 30` against 45 at `-g 15` |
+
+Every export is now **verified rather than assumed**: after ffmpeg exits,
+`ffprobe -count_frames` counts what is actually in the file, and a short count
+prints a warning naming the cause. Timing an export and calling it done is the
+mistake that hid this for a whole session.
+
+### The lesson worth keeping
+
+`proc 3.5 + rb 6.5 + pipe 2.6` was a true measurement of throughput on a stream
+that was quietly losing 27% of its pictures. **A throughput number and a
+correctness number are different claims, and the encoder here only ever
+satisfied the first.** Pair them in the same run.
 
 ## Gotchas worth knowing
 
