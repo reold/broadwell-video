@@ -548,13 +548,18 @@ impl App {
             }
         }
 
-        let total = exporter.finish()?;
+        let (total, clean_exit) = exporter.finish()?;
         let elapsed = export_start.elapsed().as_secs_f64();
         println!(
-            "  done: {} frames in {:.1}s ({:.1} fps)",
+            "  done: {} frames in {:.1}s ({:.1} fps){}",
             total,
             elapsed,
-            total as f64 / elapsed
+            total as f64 / elapsed,
+            if clean_exit {
+                ""
+            } else {
+                " (ffmpeg exited non-zero after writing the file)"
+            }
         );
         Ok(total)
     }

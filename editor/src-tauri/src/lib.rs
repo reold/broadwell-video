@@ -334,26 +334,58 @@ fn spawn_video(
                         match renderer.render_frame(&surface, &config) {
                             Ok(hwa_core::renderer::FrameOutcome::Eof) => {
                                 match renderer.finish_export() {
-                                    Ok(frames) => {
+                                    Ok((frames, clean_exit)) => {
                                         println!("export finished: {frames} frames -> {output}");
-                                        // Count what actually landed in the
-                                        // file rather than trusting that the
-                                        // process exited zero.
+                                        // The file is the source of truth, not
+                                        // the exit status: iHD aborts during
+                                        // teardown after the muxer has already
+                                        // finished, so a correct file can arrive
+                                        // with a non-zero exit.
                                         match hwa_core::export::count_output_frames(&output) {
                                             Some(in_file) if in_file >= frames => {
                                                 println!("export verified: {in_file} frames in the file");
+                                                if !clean_exit {
+                                                    println!(
+                                                        "note: ffmpeg exited non-zero after writing a complete \
+                                                         file (known iHD teardown abort)"
+                                                    );
+                                                }
+                                                report_export(&renderer.state, ExportStage::Done, None);
                                             }
                                             Some(in_file) => {
+                                                let missing = frames.saturating_sub(in_file);
                                                 println!(
-                                                    "WARNING: wrote {frames} frames but the file holds {in_file}. \
-                                                     {} were dropped by the encoder, and every picture referencing \
-                                                     one is undecodable too. Set HWA_EXPORT_ENCODER=x264.",
-                                                    frames.saturating_sub(in_file)
+                                                    "WARNING: wrote {frames} frames but the file holds {in_file}; \
+                                                     {missing} were lost, and every picture referencing one is \
+                                                     undecodable too. Set HWA_EXPORT_ENCODER=x264 to use the \
+                                                     software encoder."
+                                                );
+                                                report_export(
+                                                    &renderer.state,
+                                                    ExportStage::Failed,
+                                                    Some(format!("{in_file} of {frames} frames survived")),
                                                 );
                                             }
-                                            None => println!("export verification skipped (ffprobe unavailable)"),
+                                            None => {
+                                                println!(
+                                                    "export not verified (ffprobe unavailable); ffmpeg exit was {}",
+                                                    if clean_exit { "clean" } else { "abnormal" }
+                                                );
+                                                report_export(
+                                                    &renderer.state,
+                                                    if clean_exit {
+                                                        ExportStage::Done
+                                                    } else {
+                                                        ExportStage::Failed
+                                                    },
+                                                    if clean_exit {
+                                                        None
+                                                    } else {
+                                                        Some("ffmpeg exited abnormally and the output could not be verified".into())
+                                                    },
+                                                );
+                                            }
                                         }
-                                        report_export(&renderer.state, ExportStage::Done, None);
                                     }
                                     Err(e) => report_export(
                                         &renderer.state,

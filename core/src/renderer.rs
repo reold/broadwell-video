@@ -663,11 +663,12 @@ impl PreviewRenderer {
         Ok(())
     }
 
-    /// Close the pipe and wait for ffmpeg. Returns the frames written.
-    pub fn finish_export(&mut self) -> Result<u64> {
+    /// Close the pipe and wait for ffmpeg. Returns the frames written and
+    /// whether it exited cleanly.
+    pub fn finish_export(&mut self) -> Result<(u64, bool)> {
         match self.export.take() {
             Some(exporter) => exporter.finish(),
-            None => Ok(0),
+            None => Ok((0, true)),
         }
     }
 

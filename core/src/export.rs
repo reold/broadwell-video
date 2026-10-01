@@ -197,23 +197,26 @@ impl Exporter {
         // slower but encodes every frame it is given, which makes it the
         // control in that experiment and a usable fallback if the hardware
         // encoder cannot be tamed.
-        // The hardware encoder is NOT the default, and that is a deliberate
-        // reversal of the plan this project was built around.
+        // Hardware encoding is back on, via the driver that is still maintained.
         //
-        // Measured on this machine: `h264_vaapi` through the i965 driver drops
-        // input frames (0-27 per 900, and 0-3 per 900 even when the input is
-        // nothing but black frames piped straight into ffmpeg, so it is the
-        // encoder and not this pipeline), and with `-bf 0` each drop takes the
-        // rest of its GOP with it. It also sometimes dies outright:
+        // The failure this project spent a session diagnosing was never the
+        // silicon: it was the *archived* i965 driver. Measured on this machine
+        // with 899 synthetic black frames piped straight into ffmpeg, i965 lost
+        // input frames (840 decodable) and once aborted on an
+        // i965_MapBuffer2 assertion, leaving an mp4 with no moov atom. The same
+        // test through iHD is 899/899, three runs out of three, and end to end
+        // on real 1080p30 it runs at 42.4 fps with 899 frames written and 899
+        // decodable -- against i965's 26.8 fps and 817.
         //
-        //   i965_drv_video.c:3433: i965_MapBuffer2:
-        //   Assertion `coded_buffer_segment->base.buf' failed.
-        //
-        // which leaves an mp4 with no moov atom, i.e. an unplayable file. It is
-        // fast (26.8 fps end to end against libx264's 6.9) and it is the reason
-        // this project exists, but a fast broken export is worth less than a
-        // slow correct one. `HWA_EXPORT_ENCODER=vaapi` opts back in.
-        let encoder = std::env::var("HWA_EXPORT_ENCODER").unwrap_or_else(|_| "x264".to_string());
+        // Intel's own platform table says BDW is `D/Es`: decode plus PAK+shader
+        // encoding, never `E` (VDENC/HuC), so the EUs are still shared with
+        // compute and there is no low-power block. It also says BDW encode only
+        // exists in the Full-Feature build, which is what Arch ships as
+        // `intel-media-driver`; the Free-Kernel build would expose decode only.
+        let encoder = std::env::var("HWA_EXPORT_ENCODER").unwrap_or_else(|_| "vaapi".to_string());
+        // Set on the child only, so the decode path keeps whatever driver the
+        // system is configured for.
+        let driver = std::env::var("HWA_EXPORT_VAAPI_DRIVER").unwrap_or_else(|_| "iHD".to_string());
         // ultrafast because this is a two-core 15 W CPU and the export should
         // finish: measured end to end on Jellyfish, 52.0 fps against veryfast's
         // 21.9, both with every frame present. The cost is a larger file, which
@@ -279,6 +282,7 @@ impl Exporter {
             ])
             .args(&tail)
             .arg(output)
+            .env("LIBVA_DRIVER_NAME", &driver)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -312,13 +316,17 @@ impl Exporter {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<u64> {
+    /// Close the pipe and wait for ffmpeg.
+    ///
+    /// Returns the frames written and whether ffmpeg exited cleanly. Those are
+    /// separate questions because iHD aborts during teardown (`free(): invalid
+    /// pointer`) *after* the muxer has finished, so a complete and correct file
+    /// can arrive with a non-zero exit. The file is the source of truth, so
+    /// callers verify the output rather than the status.
+    pub fn finish(mut self) -> Result<(u64, bool)> {
         self.stdin.take();
         let status = self.child.wait().context("wait on ffmpeg failed")?;
-        if !status.success() {
-            bail!("ffmpeg exited with {status}");
-        }
-        Ok(self.frames)
+        Ok((self.frames, status.success()))
     }
 
     /// Abandon the export, discarding whatever was written.

@@ -145,8 +145,8 @@ warp) need their own passes.
 | 1080p H.264 playback at source frame rate | works |
 | Aspect-correct letterbox, including non-square pixels | works |
 | Play / pause / seek / scrub over Tauri IPC | works |
-| Hardware `h264_vaapi` export | **unreliable on this driver — see below** |
-| Software export through libx264 | correct, and the default |
+| Hardware `h264_vaapi` export through **iHD** | **45.1 fps, complete — the default** |
+| Software export through libx264 | 52.0 fps, complete — the fallback |
 | Scrubbing at display rate | in progress |
 | Audio | not started |
 | Effect chain | not started |
@@ -247,88 +247,83 @@ works without typing anything and cannot overwrite the original. The preview
 pane holds its last frame while an export runs; export takes priority over
 preview pacing, and back-pressure comes from ffmpeg's pipe rather than a sleep.
 
-### The hardware encoder on this machine cannot be trusted
+### The hardware encoder works — through iHD, not i965
 
-This is the one part of the pipeline the hardware does not deliver, and it took
-a frame count to see it. The original throughput figure — 75–77 fps for 1080p —
-was measured and is real:
+This section is a correction, because the first version of it concluded the
+opposite. The hardware encoder is not the problem. **The archived i965 driver
+is**, and this machine also has the maintained one installed.
+
+The evidence, all measured on this machine with the same 1080p30 Jellyfish
+clip or with synthetic frames:
+
+| encoder / driver | fps | frames written → decodable |
+|---|---|---|
+| `h264_vaapi` via **i965** | 26.8 | 899 → **817** |
+| `h264_vaapi` via **iHD** | **45.1** | 899 → **899** |
+| libx264 `ultrafast` | 52.0 | 899 → **899** |
+
+And the isolation test — 899 synthetic *black* frames piped straight into
+ffmpeg, with no decoder, no grade, no readback and nothing of this project in
+the path:
 
 ```
-proc 3.5 ms   rb 6.5 ms   pipe 2.6 ms   →  13 ms/frame
+i965: 899 written → 898 packets → 840 decodable
+iHD:  899 written → 899 packets → 899 decodable   (3 runs, 3 clean)
 ```
 
-Less than 3 ms of that is the encoder waiting, so the encoder was never the
-throughput limit. What was never checked is whether the output was complete.
-It was not.
-
-| | written | packets muxed | decodable pictures |
-|---|---|---|---|
-| `hwa-preview` export, 1080p real content | 899 | 872 | **817** |
-| editor export, same file | 900 | 888 | **543** |
-| editor export, second attempt | 900 | 900 | 900 |
-| no decoder, no wgpu, no readback — 899 synthetic black frames straight into ffmpeg | 899 | 898 | **840** |
-
-The last row is the one that matters. With nothing of ours involved — no
-decoder, no grade, no readback, no pipeline — the encoder still dropped an input
-frame, and because `-bf 0` leaves no B-frames to reorder, every later picture in
-that GOP referenced a frame that never arrived and the decoder emitted nothing
-for them. **One dropped frame cost 58 pictures.**
-
-It also aborts outright. One run died on
+i965 dropped input frames and once aborted on
 
 ```
 i965_drv_video.c:3433: i965_MapBuffer2:
 Assertion `coded_buffer_segment->base.buf' failed.
 ```
 
-which leaves an mp4 with no moov atom: an unplayable file rather than a lossy
-one. The drops are intermittent — one batch of nine runs at `-g 60` was clean
-eight times — but they never disappear.
+leaving an mp4 with no moov atom. iHD does the same work on the same silicon
+without losing a frame.
 
-### What it means, and what the defaults are
+How this was missed for a whole session: the project assumed from the start that
+this GPU generation required the legacy i965 driver, and that assumption was
+never tested. The check that found it took one command — compare the two
+drivers with `vainfo`, then run the isolation test with `LIBVA_DRIVER_NAME=iHD`.
 
-Broadwell has no VDENC and no HuC firmware: Gen8 uses the PAK + shader encoder,
-which runs motion estimation and macroblock kernels on the same 24 EUs as
-everything else, under a 15 W envelope, through a driver Intel archived in
-October 2024. Skylake and later have the low-power fixed-function encoder;
-Broadwell does not, and Intel's current iHD driver lists AVC *encode* as a
-Broxton-and-later feature, with Broadwell supported for decode only.
+Two details worth knowing:
 
-So `libx264` is the default and `HWA_EXPORT_ENCODER=vaapi` opts back in. A fast
-broken export is worth less than a slow correct one.
+- **iHD aborts during teardown** (`free(): invalid pointer`) *after* the muxer
+  has finished, so a complete file arrives with a non-zero exit. Exports
+  therefore treat the file as the source of truth, not the exit status: the
+  frame count is verified and a clean count is reported as success with a note.
+- Intel's own platform table lists BDW as **`D/Es`** for AVC — decode plus
+  PAK+shader encoding, never `E` (VDENC/HuC), so Broadwell genuinely has no
+  low-power fixed-function encoder and the encoder shares its 24 EUs with
+  compute work. It also says BDW encoding exists only in the **Full-Feature**
+  build, which is what Arch ships as `intel-media-driver`; the Free-Kernel
+  build exposes decode only. A claim that iHD supports AVC encode only from
+  Broxton onwards is **wrong**, and it is what made the hardware look finished.
 
-Measured end to end on the Jellyfish clip, 30 s of 1080p30, through this
-pipeline:
-
-| encoder | fps | frames written → decodable | size |
-|---|---|---|---|
-| `h264_vaapi` | 26.8 | 899 → **817** | 65 MB |
-| libx264 `ultrafast` | **52.0** | 899 → **899** | 90 MB |
-| libx264 `veryfast` | 21.9 | 899 → **899** | 55 MB |
-| libx264 `medium` | 6.9 | 899 → **899** | 56 MB |
-
-The software encoder is not a consolation prize here: at `ultrafast` it is
-**twice as fast as the hardware encoder** on this machine, and it is the only
-one that produces a complete file. Two cores are enough for 1080p30 when the
-preset is chosen for throughput rather than file size.
+The driver is selected for the ffmpeg child only, so the decode path keeps
+whatever the system is configured for.
 
 | variable | default | why |
 |---|---|---|
-| `HWA_EXPORT_ENCODER` | `x264` | the hardware encoder loses frames and can abort |
-| `HWA_EXPORT_X264_PRESET` | `ultrafast` | 52 fps measured; `veryfast`/`medium` trade speed for size |
+| `HWA_EXPORT_ENCODER` | `vaapi` | hardware encode, 45 fps, verified complete |
+| `HWA_EXPORT_VAAPI_DRIVER` | `iHD` | i965 is archived and loses frames |
+| `HWA_EXPORT_X264_PRESET` | `ultrafast` | fallback encoder; 52 fps, 90 MB vs `veryfast`'s 21.9 fps, 55 MB |
 | `HWA_EXPORT_GOP` | `30` | with `-bf 0` a drop costs up to one GOP; measured, 186 pictures lost at `-g 30` against 45 at `-g 15` |
 
-Every export is now **verified rather than assumed**: after ffmpeg exits,
+Every export is **verified rather than assumed**: after ffmpeg exits,
 `ffprobe -count_frames` counts what is actually in the file, and a short count
-prints a warning naming the cause. Timing an export and calling it done is the
-mistake that hid this for a whole session.
+is reported as a failure naming the cause. That check is what turned an
+unexplained "glitchy file" into a driver diagnosis, and it is what allows a
+correct export to be accepted from a process that exited abnormally.
 
 ### The lesson worth keeping
 
 `proc 3.5 + rb 6.5 + pipe 2.6` was a true measurement of throughput on a stream
 that was quietly losing 27% of its pictures. **A throughput number and a
-correctness number are different claims, and the encoder here only ever
-satisfied the first.** Pair them in the same run.
+correctness number are different claims, and the i965 encoder only ever
+satisfied the first.** Pair them in the same run — and when a component is
+written off as "the hardware", check that the driver being used is the one that
+is still maintained.
 
 ## Gotchas worth knowing
 
