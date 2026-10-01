@@ -188,6 +188,43 @@ impl Exporter {
         let size = format!("{width}x{height}");
         let rate = format!("{fps:.6}");
 
+        // `HWA_EXPORT_ENCODER=x264` swaps the hardware encoder for libx264.
+        //
+        // Not a preference: i965 on this GPU drops the occasional input frame,
+        // and with no B-frames the muxer absorbs the loss as a double-length
+        // packet while every picture that referenced the missing one becomes
+        // undecodable, so a whole GOP is lost each time it happens. x264 is
+        // slower but encodes every frame it is given, which makes it the
+        // control in that experiment and a usable fallback if the hardware
+        // encoder cannot be tamed.
+        let encoder = std::env::var("HWA_EXPORT_ENCODER").unwrap_or_else(|_| "vaapi".to_string());
+        let tail: Vec<String> = if encoder == "x264" {
+            ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-bf", "0", "-g", "60"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            [
+                "-vaapi_device",
+                "/dev/dri/renderD128",
+                "-vf",
+                "format=nv12,hwupload",
+                "-c:v",
+                "h264_vaapi",
+                "-rc_mode",
+                "CQP",
+                "-qp",
+                "22",
+                "-bf",
+                "0",
+                "-g",
+                "60",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+        };
+
         let mut child = Command::new("ffmpeg")
             .args([
                 "-hide_banner",
@@ -204,22 +241,9 @@ impl Exporter {
                 &rate,
                 "-i",
                 "-",
-                "-vaapi_device",
-                "/dev/dri/renderD128",
-                "-vf",
-                "format=nv12,hwupload",
-                "-c:v",
-                "h264_vaapi",
-                "-rc_mode",
-                "CQP",
-                "-qp",
-                "22",
-                "-bf",
-                "0",
-                "-g",
-                "60",
-                output,
             ])
+            .args(&tail)
+            .arg(output)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
