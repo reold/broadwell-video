@@ -77,6 +77,13 @@ pub struct PreviewRenderer {
     pub lag_samples: u64,
     pub chase_time: Duration,
     pub map_time: Duration,
+    /// Map cost split by whether this call seeked first. Decides whether the
+    /// export is expensive because the decoder pipeline was just flushed, or
+    /// because a chase filled it with a burst of frames.
+    pub map_seek_time: Duration,
+    pub map_seek_count: u64,
+    pub map_warm_time: Duration,
+    pub map_warm_count: u64,
     pub import_time: Duration,
     pub present_time: Duration,
 }
@@ -132,6 +139,10 @@ impl PreviewRenderer {
             lag_samples: 0,
             chase_time: Duration::ZERO,
             map_time: Duration::ZERO,
+            map_seek_time: Duration::ZERO,
+            map_seek_count: 0,
+            map_warm_time: Duration::ZERO,
+            map_warm_count: 0,
             import_time: Duration::ZERO,
             present_time: Duration::ZERO,
         })
@@ -204,6 +215,7 @@ impl PreviewRenderer {
         // scrub update cost 15-26 ms.
         let deadline = Instant::now() + CHASE_BUDGET;
         let t_chase = Instant::now();
+        let mut seeked_this_call = false;
 
         // ---- Decode, chasing the newest target within the budget ----
         unsafe {
@@ -221,6 +233,7 @@ impl PreviewRenderer {
                     if needs_seek(self.last_pts, ms) {
                         self.ff.seek_to_ms(ms)?;
                         self.seeks += 1;
+                        seeked_this_call = true;
                     }
                     self.prune_to_ms = Some(ms);
                 }
@@ -286,8 +299,16 @@ impl PreviewRenderer {
                 "av_hwframe_map",
             )?;
             // Timed separately: this is the call that has to sync the video
-            // engine, and the log suggests it is what a seek makes expensive.
-            self.map_time += t_map.elapsed();
+            // engine, and it is the entire cost of the import phase.
+            let map_elapsed = t_map.elapsed();
+            self.map_time += map_elapsed;
+            if seeked_this_call {
+                self.map_seek_time += map_elapsed;
+                self.map_seek_count += 1;
+            } else {
+                self.map_warm_time += map_elapsed;
+                self.map_warm_count += 1;
+            }
             av_frame_unref(self.ff.decoded);
 
             let desc = (*self.ff.drm_frame).data[0] as *const AVDRMFrameDescriptor;

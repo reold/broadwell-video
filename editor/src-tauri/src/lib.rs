@@ -271,19 +271,38 @@ fn spawn_video(
                 } else {
                     0.0
                 };
+                let map_seek = if renderer.map_seek_count > 0 {
+                    renderer.map_seek_time.as_secs_f64() * 1000.0
+                        / renderer.map_seek_count as f64
+                } else {
+                    0.0
+                };
+                let map_warm = if renderer.map_warm_count > 0 {
+                    renderer.map_warm_time.as_secs_f64() * 1000.0
+                        / renderer.map_warm_count as f64
+                } else {
+                    0.0
+                };
                 println!(
-                    "loop {:.1}/s | video {:.2} fps | iter {:.2} ms | render {:.2} = chase {:.1} + map {:.1} + import {:.1} + present {:.1} | presents {:.1}/s seeks {:.1}/s rewinds {} | lag {:.0} ms | pos {} / {} | playing {} | cache h{} m{} sz{}",
+                    "loop {:.1}/s | iter {:.2} ms | render {:.2} = chase {:.1} + map {:.1} + rest {:.1} + present {:.1} | map after-seek {:.1} (n{}) vs warm {:.1} (n{}) | presents {:.1}/s seeks {:.1}/s | lag {:.0} ms | pos {} / {} | playing {} | cache h{} m{} sz{}",
                     n / secs,
-                    renderer.ff.fps,
                     t_total.as_secs_f64() * 1000.0 / n,
                     t_render.as_secs_f64() * 1000.0 / n,
                     renderer.chase_time.as_secs_f64() * 1000.0 / active,
                     renderer.map_time.as_secs_f64() * 1000.0 / active,
-                    renderer.import_time.as_secs_f64() * 1000.0 / active,
+                    renderer
+                        .import_time
+                        .saturating_sub(renderer.map_time)
+                        .as_secs_f64()
+                        * 1000.0
+                        / active,
                     renderer.present_time.as_secs_f64() * 1000.0 / active,
+                    map_seek,
+                    renderer.map_seek_count,
+                    map_warm,
+                    renderer.map_warm_count,
                     renderer.presents as f64 / secs,
                     renderer.seeks as f64 / secs,
-                    renderer.rewinds,
                     lag,
                     snap.position_ms,
                     snap.duration_ms,
@@ -305,6 +324,10 @@ fn spawn_video(
                 renderer.lag_samples = 0;
                 renderer.chase_time = Duration::ZERO;
                 renderer.map_time = Duration::ZERO;
+                renderer.map_seek_time = Duration::ZERO;
+                renderer.map_seek_count = 0;
+                renderer.map_warm_time = Duration::ZERO;
+                renderer.map_warm_count = 0;
                 renderer.import_time = Duration::ZERO;
                 renderer.present_time = Duration::ZERO;
                 last_log = Instant::now();
