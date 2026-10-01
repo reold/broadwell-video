@@ -1,10 +1,10 @@
 //! Shared preview pipeline.
 
 use crate::{ffmpeg, gpu, state::SharedState};
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use ffmpeg_sys_next::*;
 use std::collections::HashMap;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 const MAX_CACHE_ENTRIES: usize = 64;
@@ -107,9 +107,9 @@ pub struct PreviewRenderer {
     pub import_time: Duration,
     pub present_time: Duration,
     /// Export phases, which are the whole cost of an export frame: the grade
-    /// passes, the readback and the blocking write into ffmpeg's pipe.
+    /// passes, the handoff into the encoder's surface, and the send.
     pub export_grade_time: Duration,
-    pub export_readback_time: Duration,
+    pub export_handoff_time: Duration,
     pub export_write_time: Duration,
     /// Recently decoded frames, graded and ready to present.
     ring: Vec<RingSlot>,
@@ -117,11 +117,18 @@ pub struct PreviewRenderer {
     /// Presents served from the ring, and frames decoded into it.
     pub ring_presents: u64,
     pub ring_decodes: u64,
-    /// Set while exporting: frames are piped to ffmpeg instead of presented.
-    export: Option<crate::export::Exporter>,
-    readback_y: wgpu::Buffer,
-    readback_uv: wgpu::Buffer,
-    readback_layout: crate::export::Nv12Readback,
+    /// Set while exporting: frames are graded into the encoder's own surfaces
+    /// instead of being presented.
+    export: Option<crate::encoder::VaapiEncoder>,
+    /// Where the running export is writing, so cancelling can remove it.
+    export_path: Option<String>,
+    /// Holds the packed grade on its way to the encoder's surface. A buffer
+    /// rather than a readback: the copy from here into the surface's planes is
+    /// done on the GPU, because HasVK has no R8/Rg8 storage textures to write
+    /// the plane directly.
+    staging_y: wgpu::Buffer,
+    staging_uv: wgpu::Buffer,
+    staging_geometry: crate::export::Nv12Readback,
     /// Playback state last seen, so the decoder can be re-anchored when
     /// scrubbing served from the ring has left it somewhere else.
     was_playing: bool,
@@ -189,19 +196,20 @@ impl PreviewRenderer {
             })
             .collect();
 
-        // Buffers for reading a packed NV12 frame back out of the GPU during an
-        // export. Allocated once, because an export reads back a frame at a time.
-        let readback_layout = crate::export::Nv12Readback::new(vw, vh);
-        let readback_y = host.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("export-readback-y"),
-            size: readback_layout.y_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        // Buffers the packed grade passes through on its way into the encoder's
+        // surface. Allocated once: an export moves one frame at a time. They are
+        // never mapped, which is the point.
+        let staging_geometry = crate::export::Nv12Readback::new(vw, vh);
+        let staging_y = host.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("export-staging-y"),
+            size: staging_geometry.y_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let readback_uv = host.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("export-readback-uv"),
-            size: readback_layout.uv_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        let staging_uv = host.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("export-staging-uv"),
+            size: staging_geometry.uv_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -232,16 +240,17 @@ impl PreviewRenderer {
             import_time: Duration::ZERO,
             present_time: Duration::ZERO,
             export_grade_time: Duration::ZERO,
-            export_readback_time: Duration::ZERO,
+            export_handoff_time: Duration::ZERO,
             export_write_time: Duration::ZERO,
             ring,
             ring_next: 0,
             ring_presents: 0,
             ring_decodes: 0,
             export: None,
-            readback_y,
-            readback_uv,
-            readback_layout,
+            export_path: None,
+            staging_y,
+            staging_uv,
+            staging_geometry,
             was_playing: true,
         })
     }
@@ -632,9 +641,9 @@ impl PreviewRenderer {
         self.export.is_some()
     }
 
-    /// Frames handed to ffmpeg by the running export.
+    /// Frames handed to the encoder by the running export.
     pub fn export_frames(&self) -> u64 {
-        self.export.as_ref().map_or(0, |e| e.frames)
+        self.export.as_ref().map_or(0, |e| e.frames_written())
     }
 
     /// Begin an export. The decoder rewinds, so the file is written from its
@@ -653,35 +662,50 @@ impl PreviewRenderer {
             s.pending_seek_ms = None;
             s.position_ms = 0;
         }
-        self.export = Some(crate::export::Exporter::new(
+        self.export = Some(crate::encoder::VaapiEncoder::new(
+            output,
             self.ff.width,
             self.ff.height,
             self.ff.fps,
-            output,
-            crate::export::PixFmt::Nv12,
+            22,
         )?);
+        self.export_path = Some(output.to_string());
         Ok(())
     }
 
-    /// Close the pipe and wait for ffmpeg. Returns the frames written and
-    /// whether it exited cleanly.
+    /// Flush the encoder and close the file. Returns the frames written and
+    /// whether it exited cleanly, which an in-process encoder always does unless
+    /// it errored — the file is verified afterwards either way.
     pub fn finish_export(&mut self) -> Result<(u64, bool)> {
         match self.export.take() {
-            Some(exporter) => exporter.finish(),
+            Some(mut encoder) => {
+                let frames = encoder.finish()?;
+                self.export_path = None;
+                Ok((frames, true))
+            }
             None => Ok((0, true)),
         }
     }
 
     /// Abandon an export, discarding the partial file.
     pub fn cancel_export(&mut self) {
-        if let Some(exporter) = self.export.take() {
-            exporter.kill();
+        // Dropping the encoder closes the container; the file it left behind is
+        // a partial export, so it goes.
+        self.export = None;
+        if let Some(path) = self.export_path.take() {
+            let _ = std::fs::remove_file(path);
         }
     }
 
-    /// Grade the imported planes to packed NV12, read them back and hand the
-    /// frame to ffmpeg. Readback is a `memcpy` per plane because the grade wrote
-    /// the packing the encoder's raw-video input expects.
+    /// Grade the imported planes and hand the result to the encoder without it
+    /// ever reaching the CPU.
+    ///
+    /// The grade still writes the packing the old readback wanted — four Y
+    /// samples and two UV pairs per `R32Uint` texel — because HasVK has no
+    /// R8/Rg8 *storage* textures, so the surface's planes cannot be written
+    /// directly. Instead the packed texels are copied into a staging buffer and
+    /// from there into the encoder's own surface, both on the GPU. What used to
+    /// be two syncs and a 3 MB memcpy per frame is now one sync.
     fn export_packed(
         &mut self,
         y_view: &wgpu::TextureView,
@@ -691,6 +715,29 @@ impl PreviewRenderer {
         let vh = self.ff.height;
         let uv_w = vw / 2;
         let uv_h = vh / 2;
+
+        // The encoder lends the surface this frame is written into. Descriptors
+        // are copied out here so the encoder is not borrowed while the GPU works.
+        let surface = match self.export.as_mut() {
+            Some(encoder) => encoder.begin_frame()?,
+            None => return Ok(()),
+        };
+        let y_plane = import_encoder_plane(
+            &self.host,
+            surface.y_fd,
+            &surface.y,
+            surface.modifier,
+            dpi::PhysicalSize::new(vw, vh),
+            wgpu::TextureFormat::R8Unorm,
+        )?;
+        let uv_plane = import_encoder_plane(
+            &self.host,
+            surface.uv_fd,
+            &surface.uv,
+            surface.modifier,
+            dpi::PhysicalSize::new(uv_w, uv_h),
+            wgpu::TextureFormat::Rg8Unorm,
+        )?;
 
         let bg_y = self
             .host
@@ -760,26 +807,94 @@ impl PreviewRenderer {
             cp.set_bind_group(0, &bg_uv, &[]);
             cp.dispatch_workgroups(uv_w.div_ceil(8), uv_h.div_ceil(8), 1);
         }
+
+        // Packed grade -> staging buffer -> the encoder's surface planes.
+        let geometry = &self.staging_geometry;
+        let y_row = geometry.y_padded_row_bytes;
+        let uv_row = geometry.uv_padded_row_bytes;
+        for (packed, staging, row_bytes, rows, texel_width) in [
+            (
+                &self.pipelines.out_y_texture,
+                &self.staging_y,
+                y_row,
+                vh,
+                vw / 4,
+            ),
+            (
+                &self.pipelines.out_uv_texture,
+                &self.staging_uv,
+                uv_row,
+                uv_h,
+                vw / 4,
+            ),
+        ] {
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: packed,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row_bytes),
+                        rows_per_image: Some(rows),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: texel_width,
+                    height: rows,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        for (staging, plane, row_bytes, rows, width) in [
+            (&self.staging_y, &y_plane, y_row, vh, vw),
+            (&self.staging_uv, &uv_plane, uv_row, uv_h, uv_w),
+        ] {
+            enc.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row_bytes),
+                        rows_per_image: Some(rows),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: plane,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height: rows,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         self.host.queue.submit([enc.finish()]);
         self.export_grade_time += t_grade.elapsed();
 
-        let t_readback = Instant::now();
-        let nv12 = crate::export::readback_nv12(
-            &self.host.device,
-            &self.host.queue,
-            &self.pipelines.out_y_texture,
-            &self.pipelines.out_uv_texture,
-            &self.readback_y,
-            &self.readback_uv,
-            vw,
-            vh,
-            &self.readback_layout,
-        )?;
-        self.export_readback_time += t_readback.elapsed();
+        // The encoder reads the surface on the video engine, so the copies have
+        // to be done before it is handed over. A wait on our own queue, not a
+        // readback.
+        let t_handoff = Instant::now();
+        self.host
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .ok();
+        self.export_handoff_time += t_handoff.elapsed();
 
         let t_write = Instant::now();
-        if let Some(exporter) = self.export.as_mut() {
-            exporter.write_frame(&nv12)?;
+        if let Some(encoder) = self.export.as_mut() {
+            encoder.write_frame()?;
         }
         self.export_write_time += t_write.elapsed();
         Ok(())
@@ -1040,6 +1155,44 @@ fn loop_period_for(frame_period: Duration, display_rate: bool) -> Duration {
     } else {
         frame_period
     }
+}
+
+/// Import one plane of an encoder surface as a texture the GPU can write into.
+///
+/// The decode direction imports the same way. The difference is `with_usage`:
+/// an import defaults to `RESOURCE | COPY_SRC` for reading a frame someone else
+/// produced, and writing this one needs `COPY_DST` as well, which is the fourth
+/// patch to the vendored grafting.
+fn import_encoder_plane(
+    host: &grafting::HostWgpuContext,
+    fd: RawFd,
+    plane: &crate::encoder::Plane,
+    modifier: u64,
+    size: dpi::PhysicalSize<u32>,
+    format: wgpu::TextureFormat,
+) -> Result<wgpu::Texture> {
+    let raw = unsafe { libc::dup(fd) };
+    if raw < 0 {
+        bail!("could not duplicate the encoder surface plane (fd {fd})");
+    }
+    let import = grafting::vulkan_dmabuf::VulkanDmaBufImport::new(
+        size,
+        format,
+        plane.fourcc,
+        modifier,
+        vec![unsafe { OwnedFd::from_raw_fd(raw) }],
+        vec![grafting::vulkan_dmabuf::VulkanDmaBufPlane {
+            buffer_index: 0,
+            offset: plane.offset,
+            stride: plane.pitch,
+        }],
+        grafting::vulkan_dmabuf::VulkanDmaBufQueueOwnership::Foreign,
+    )
+    .context("build the encoder plane import")?
+    .with_usage(
+        wgpu::TextureUses::RESOURCE | wgpu::TextureUses::COPY_SRC | wgpu::TextureUses::COPY_DST,
+    );
+    grafting::vulkan_dmabuf::import_dmabuf(import, host).context("import the encoder plane")
 }
 
 #[cfg(test)]

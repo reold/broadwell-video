@@ -502,7 +502,7 @@ fn spawn_video(
                     0.0
                 };
                 println!(
-                    "[{}] loop {:.1}/s | iter {:.2} ms | render {:.2} = chase {:.1} + map {:.1} + rest {:.1} + present {:.1} | map after-seek {:.1} (n{}) vs warm {:.1} (n{}) | presents {:.1}/s (ring {:.1}/s) seeks {:.1}/s | lag {:.0} ms | export grade {:.1} readback {:.1} write {:.1} | pos {} / {} | playing {} | cache h{} m{} sz{}",
+                    "[{}] loop {:.1}/s | iter {:.2} ms | render {:.2} = chase {:.1} + map {:.1} + rest {:.1} + present {:.1} | map after-seek {:.1} (n{}) vs warm {:.1} (n{}) | presents {:.1}/s (ring {:.1}/s) seeks {:.1}/s | lag {:.0} ms | export grade {:.1} handoff {:.1} send {:.1} | pos {} / {} | playing {} | cache h{} m{} sz{}",
                     hwa_core::wall_clock_stamp(),
                     n / secs,
                     t_total.as_secs_f64() * 1000.0 / n,
@@ -525,7 +525,7 @@ fn spawn_video(
                     renderer.seeks as f64 / secs,
                     lag,
                     renderer.export_grade_time.as_secs_f64() * 1000.0 / active,
-                    renderer.export_readback_time.as_secs_f64() * 1000.0 / active,
+                    renderer.export_handoff_time.as_secs_f64() * 1000.0 / active,
                     renderer.export_write_time.as_secs_f64() * 1000.0 / active,
                     hwa_core::timecode(snap.position_ms, renderer.ff.fps),
                     hwa_core::timecode(snap.duration_ms, renderer.ff.fps),
@@ -554,7 +554,7 @@ fn spawn_video(
                 renderer.import_time = Duration::ZERO;
                 renderer.present_time = Duration::ZERO;
                 renderer.export_grade_time = Duration::ZERO;
-                renderer.export_readback_time = Duration::ZERO;
+                renderer.export_handoff_time = Duration::ZERO;
                 renderer.export_write_time = Duration::ZERO;
                 last_log = Instant::now();
             }
