@@ -145,7 +145,7 @@ warp) need their own passes.
 | 1080p H.264 playback at source frame rate | works |
 | Aspect-correct letterbox, including non-square pixels | works |
 | Play / pause / seek / scrub over Tauri IPC | works |
-| Hardware `h264_vaapi` export | written and measured, reachable from the `hwa-preview` CLI only |
+| Hardware `h264_vaapi` export | works from the editor's Export button and from the `hwa-preview` CLI |
 | Scrubbing at display rate | in progress |
 | Audio | not started |
 | Effect chain | not started |
@@ -228,9 +228,24 @@ archive/wgpu-probe/       dead prototype, do not build
 ## IPC surface
 
 Commands: `get_state`, `toggle_play`, `set_paused`, `seek_to`, `log_msg`,
-`greet`. Event: `playhead_update` carrying `{playing, position_ms, duration_ms,
-fps}`, emitted at display rate. Shared state is `Arc<Mutex<EditorState>>`,
-registered with Tauri via `.manage()`.
+`greet`, `default_export_path`, `start_export`, `cancel_export`.
+Events: `playhead_update` carrying `{playing, position_ms, duration_ms, fps}`,
+and `export_progress` carrying `{stage, frames_done, frames_total, fps, output,
+error}`. Shared state is `Arc<Mutex<EditorState>>`, registered with Tauri via
+`.manage()`.
+
+## Export
+
+The Export button hands the render loop to ffmpeg: each iteration decodes a
+frame, grades it through the packed export shaders (`grade_y.wgsl`,
+`grade_uv.wgsl` write 4 Y samples and 2 UV pairs per `R32Uint` texel, so the
+readback is a `memcpy` per plane), and pipes packed NV12 into a child process
+running `h264_vaapi`. Measured at 75–77 fps for 1080p and 126 fps at 720p.
+
+The output path defaults to `<clip>-export.mp4` beside the source, so the button
+works without typing anything and cannot overwrite the original. The preview
+pane holds its last frame while an export runs; export takes priority over
+preview pacing, and back-pressure comes from ffmpeg's pipe rather than a sleep.
 
 ## Gotchas worth knowing
 
