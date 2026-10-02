@@ -337,7 +337,27 @@ fn verify_export(
     clean_exit: bool,
     stamp: String,
 ) {
+    // What the timeline asked for, independently of how many frames the walk
+    // produced. Without this a truncated export verified clean: the only
+    // question asked was whether what got written could be read back.
+    let expected = state.lock().unwrap().expected_frames();
+    let clips = state.lock().unwrap().clips.len() as u64;
+    let short = frames < expected.saturating_sub(1 + clips);
+
     match hwa_core::export::probe_output_frames(&output) {
+        hwa_core::export::OutputFrames::Counted(in_file) if in_file >= frames && short => {
+            println!(
+                "[{stamp}] WARNING: the timeline asks for about {expected} frames and the export \
+                 produced {frames}. The file is readable, but it is not the whole edit."
+            );
+            report_export(
+                &state,
+                ExportStage::Failed,
+                Some(format!(
+                    "the export stopped early: {frames} of about {expected} frames"
+                )),
+            );
+        }
         hwa_core::export::OutputFrames::Counted(in_file) if in_file >= frames => {
             println!("[{stamp}] export verified: {in_file} frames in the file");
             if !clean_exit {

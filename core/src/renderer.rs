@@ -108,6 +108,12 @@ pub struct PreviewRenderer {
     look_version_seen: u64,
     /// Which clip of the timeline the decoder is reading.
     clip_index: usize,
+    /// Whether a frame inside the current clip has been seen since the last
+    /// seek. A seek can hand back the frame the decoder was already holding,
+    /// and that frame belongs to the clip we just left -- past the end of the
+    /// new one, which read as "time to move on" and walked the index off the
+    /// end of the timeline.
+    clip_frame_seen: bool,
     pub map_warm_time: Duration,
     pub map_warm_count: u64,
     pub import_time: Duration,
@@ -274,6 +280,7 @@ impl PreviewRenderer {
             map_failures: 0,
             look_version_seen: 0,
             clip_index: 0,
+            clip_frame_seen: false,
             map_warm_time: Duration::ZERO,
             map_warm_count: 0,
             import_time: Duration::ZERO,
@@ -472,12 +479,35 @@ impl PreviewRenderer {
                     // it lands in is the one to walk from next.
                     if let Some(i) = self.state.lock().unwrap().clip_index_for_source(ms) {
                         self.clip_index = i;
+                        self.clip_frame_seen = false;
                     }
                 }
 
                 match self.decode_step() {
                     DecodeStep::Frame => {}
                     DecodeStep::Eof => {
+                        // Ask the clip list before believing the decoder.
+                        //
+                        // A clip can end at the end of the file with more clips
+                        // after it -- they read earlier ranges, which is what
+                        // cutting a piece off the tail and dragging it to the
+                        // front produces. The decoder reports Eof there and
+                        // never produces a frame past the clip's out point, so
+                        // the walk had nothing to notice the boundary by and the
+                        // export simply stopped: 152 frames of a 900 frame
+                        // timeline, verified clean.
+                        let next_clip_in = {
+                            let s = self.state.lock().unwrap();
+                            s.clips.get(self.clip_index + 1).map(|c| c.in_ms)
+                        };
+                        if let Some(in_ms) = next_clip_in {
+                            self.clip_index += 1;
+                            self.clip_frame_seen = false;
+                            unsafe { self.ff.seek_to_ms(in_ms)? };
+                            self.prune_to_ms = Some(in_ms);
+                            self.seeks += 1;
+                            continue;
+                        }
                         if self.prune_to_ms.take().is_some() {
                             // Dragged past the end of the file. Hold the last
                             // frame rather than rewinding under a cursor that is
@@ -540,6 +570,26 @@ impl PreviewRenderer {
                     // The two cases are distinct and must not be guessed at from
                     // the times involved: running past a clip's out point moves
                     // on, landing before its in point does not.
+                    // A seek can hand back the frame the decoder was already
+                    // holding, and that frame belongs to the clip just left: it
+                    // reads as past the end of the new one, which walked the
+                    // index off the end of the timeline and ended the export a
+                    // third of the way through. Drop it and decode again rather
+                    // than seeking, so a decoder that keeps handing it back
+                    // cannot spin.
+                    if !self.clip_frame_seen {
+                        let outside = {
+                            let s = self.state.lock().unwrap();
+                            s.clips
+                                .get(self.clip_index)
+                                .is_some_and(|c| pts >= c.out_ms || pts < c.in_ms)
+                        };
+                        if outside {
+                            av_frame_unref(self.ff.decoded);
+                            continue;
+                        }
+                    }
+
                     let jump: Option<Option<(i64, bool)>> = {
                         let s = self.state.lock().unwrap();
                         match s.clips.get(self.clip_index) {
@@ -562,6 +612,7 @@ impl PreviewRenderer {
                             if advance {
                                 self.clip_index += 1;
                             }
+                            self.clip_frame_seen = false;
                             // Seek here rather than queueing one. The queue is
                             // the UI's channel, and its handler re-derives which
                             // clip to walk from the source position -- which is
@@ -587,6 +638,7 @@ impl PreviewRenderer {
 
                 // This is the frame we render. The state speaks timeline
                 // milliseconds; the decoder speaks source milliseconds.
+                self.clip_frame_seen = true;
                 {
                     let mut s = self.state.lock().unwrap();
                     s.position_ms = s.timeline_for_source(pts);

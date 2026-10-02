@@ -577,6 +577,18 @@ impl EditorState {
         self.position_ms = 0;
     }
 
+    /// How many frames the timeline asks for.
+    ///
+    /// Derived from the clips rather than read from `duration_ms`, so it is the
+    /// authority on the question even if that field is ever wrong. The export is
+    /// checked against this: a walk that stops early otherwise verifies clean,
+    /// because asking whether what was written is readable says nothing about
+    /// whether all of it was written.
+    pub fn expected_frames(&self) -> u64 {
+        let ms: i64 = self.clips.iter().map(|c| c.duration_ms()).sum();
+        ((ms.max(0) as f64 / 1000.0) * self.fps).round() as u64
+    }
+
     /// Recompute the timeline length from the clips.
     pub fn refresh_duration(&mut self) {
         self.duration_ms = self.clips.iter().map(|c| c.duration_ms()).sum();
