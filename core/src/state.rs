@@ -352,6 +352,9 @@ pub struct EditorState {
     pub pending_seek_ms: Option<i64>,
     /// Path of the file being edited, so an export can suggest a name.
     pub video_path: String,
+    /// Length of that file. Not the same as `duration_ms`, which is the length
+    /// of the *timeline* once clips have been cut, moved or removed.
+    pub source_duration_ms: i64,
     /// The edit itself. Empty means the whole file, which is what a freshly
     /// opened clip gets.
     pub clips: Vec<Clip>,
@@ -439,6 +442,7 @@ impl EditorState {
             fps: 30.0,
             pending_seek_ms: None,
             video_path: String::new(),
+            source_duration_ms: 0,
             clips: Vec::new(),
             export: None,
             undo: Vec::new(),

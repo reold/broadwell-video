@@ -106,6 +106,8 @@ pub struct PreviewRenderer {
     pub map_failures: u64,
     /// The look version whose frames the ring holds.
     look_version_seen: u64,
+    /// Which clip of the timeline the decoder is reading.
+    clip_index: usize,
     pub map_warm_time: Duration,
     pub map_warm_count: u64,
     pub import_time: Duration,
@@ -262,6 +264,7 @@ impl PreviewRenderer {
             map_seek_count: 0,
             map_failures: 0,
             look_version_seen: 0,
+            clip_index: 0,
             map_warm_time: Duration::ZERO,
             map_warm_count: 0,
             import_time: Duration::ZERO,
@@ -456,6 +459,11 @@ impl PreviewRenderer {
                         seeked_this_call = true;
                     }
                     self.prune_to_ms = Some(ms);
+                    // A seek moves the timeline as well as the decoder: the clip
+                    // it lands in is the one to walk from next.
+                    if let Some(i) = self.state.lock().unwrap().clip_index_for_source(ms) {
+                        self.clip_index = i;
+                    }
                 }
 
                 match self.decode_step() {
@@ -507,20 +515,40 @@ impl PreviewRenderer {
                 // place, and do it forever. So this runs when the timeline is
                 // settled, and its own jump is a pending seek like any other,
                 // which the loop above turns into a seek plus a prune.
+                //
+                // The walk is by clip *index*, not by source position. The clips
+                // are a list in timeline order, and that order is whatever the
+                // user dragged it into -- it has nothing to do with where the
+                // ranges sit in the file. Inferring the next clip from the
+                // current position ended the walk at the end of the first clip
+                // whenever the timeline was not in ascending source order, so an
+                // export after a reorder, or after deleting a clip and undoing
+                // the delete, came out short: 152 frames where the timeline asked
+                // for 301, and the short file verified clean, because the check
+                // only asks whether what was written is readable.
                 if self.prune_to_ms.is_none() {
                     let jump = {
                         let s = self.state.lock().unwrap();
-                        if s.clips.iter().any(|c| c.contains(pts)) {
-                            None
-                        } else if s.clips.last().is_some_and(|last| pts >= last.out_ms) {
-                            Some(None)
-                        } else {
-                            s.next_clip_in(pts).map(Some)
+                        match s.clips.get(self.clip_index) {
+                            None => Some(None),
+                            Some(clip) if pts >= clip.out_ms => {
+                                match s.clips.get(self.clip_index + 1) {
+                                    Some(next) => Some(Some(next.in_ms)),
+                                    None => Some(None),
+                                }
+                            }
+                            // Before this clip's in point, which a seek to an
+                            // earlier keyframe can land on. Nothing to show.
+                            Some(clip) if pts < clip.in_ms => Some(Some(clip.in_ms)),
+                            Some(_) => None,
                         }
                     };
                     match jump {
                         Some(Some(in_ms)) => {
                             av_frame_unref(self.ff.decoded);
+                            if pts >= in_ms {
+                                self.clip_index += 1;
+                            }
                             self.state.lock().unwrap().pending_seek_ms = Some(in_ms);
                             continue;
                         }
@@ -791,6 +819,8 @@ impl PreviewRenderer {
         self.ring_clear();
         self.prune_to_ms = None;
         self.last_pts = 0;
+        // An export always starts at the head of the timeline.
+        self.clip_index = 0;
         // A seek left over from moving the playhead would otherwise be picked up
         // by the first export frame and start the file somewhere else.
         self.encoder_imports.clear();
