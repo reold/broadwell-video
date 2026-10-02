@@ -33,6 +33,8 @@
   let positionMs = $state(0);
   let durationMs = $state(60_000);
   let playing = $state(true);
+  /// The clip's frame rate, from the core. The timecode used to assume 30. */
+  let fps = $state(30);
   let pxPerSecond = $state(40);
   let dragging = $state(false);
   let lanesEl: HTMLDivElement;
@@ -40,6 +42,7 @@
   let playheadPx = $derived((positionMs / 1000) * pxPerSecond);
   let totalSeconds = $derived(durationMs / 1000);
   let formattedTime = $derived(formatTc(positionMs / 1000));
+  let formattedDuration = $derived(formatTc(durationMs / 1000));
 
   let tickStep = $derived(
     totalSeconds <= 30 ? 1 :
@@ -54,14 +57,18 @@
     )
   );
 
-  function formatTc(sec: number): string {
+  /// HH:MM:SS:FF at the clip's own rate. `withFrames` off gives the short form
+  /// the ruler wants.
+  function formatTc(sec: number, withFrames = true): string {
     const s = Math.max(0, sec);
     const hh = Math.floor(s / 3600);
     const mm = Math.floor((s % 3600) / 60);
     const ss = Math.floor(s % 60);
-    const ff = Math.floor((s % 1) * 30);
+    const ff = Math.floor((s % 1) * (fps || 30));
     const p = (n: number) => n.toString().padStart(2, "0");
-    return `${p(hh)}:${p(mm)}:${p(ss)}:${p(ff)}`;
+    return withFrames
+      ? `${p(hh)}:${p(mm)}:${p(ss)}:${p(ff)}`
+      : `${p(hh)}:${p(mm)}:${p(ss)}`;
   }
 
   onMount(() => {
@@ -69,6 +76,7 @@
       positionMs = s.position_ms;
       durationMs = s.duration_ms || 60_000;
       playing = s.playing;
+      if (s.fps > 0) fps = s.fps;
     });
 
     invoke<string>("default_export_path").then((p) => {
@@ -82,6 +90,7 @@
       }
       durationMs = s.duration_ms || durationMs;
       playing = s.playing;
+      if (s.fps > 0) fps = s.fps;
     });
 
     const unlistenExport = listen<ExportProgress>("export_progress", (event) => {
@@ -89,9 +98,59 @@
       exportError = event.payload.error ?? "";
     });
 
+    // Keyboard is most of the difference between a scrub bar and an editor.
+    // Ignored while the export path field has focus, or space would type a
+    // space and never reach the transport.
+    function onKey(e: KeyboardEvent) {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      switch (e.key) {
+        case " ":
+          e.preventDefault();
+          togglePlay();
+          break;
+        case "ArrowLeft":
+          e.preventDefault();
+          if (e.shiftKey) stepSeconds(-1);
+          else stepFrames(-1);
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          if (e.shiftKey) stepSeconds(1);
+          else stepFrames(1);
+          break;
+        // Blender's pair, and the ones a video editor expects.
+        case ",":
+          e.preventDefault();
+          stepFrames(-1);
+          break;
+        case ".":
+          e.preventDefault();
+          stepFrames(1);
+          break;
+        case "Home":
+          e.preventDefault();
+          seekTo(0);
+          break;
+        case "End":
+          e.preventDefault();
+          seekTo(durationMs);
+          break;
+      }
+    }
+    window.addEventListener("keydown", onKey);
+
     return () => {
       unlisten.then((f) => f());
       unlistenExport.then((f) => f());
+      window.removeEventListener("keydown", onKey);
     };
   });
 
@@ -110,6 +169,35 @@
 
   function togglePlay() {
     invoke<boolean>("toggle_play").then((p) => (playing = p));
+  }
+
+  // ---- Transport ----
+  //
+  // There is no playback rate in the core, so a step is a seek: one frame, or
+  // one second. Stepping pauses first, because stepping through a moving
+  // playhead is a fight.
+
+  function seekTo(ms: number) {
+    const clamped = Math.max(0, Math.min(durationMs, Math.round(ms)));
+    positionMs = clamped;
+    invoke("seek_to", { ms: clamped }).catch(() => {});
+  }
+
+  function pauseForStep() {
+    if (playing) {
+      playing = false;
+      invoke("set_paused", { paused: true }).catch(() => {});
+    }
+  }
+
+  function stepFrames(n: number) {
+    pauseForStep();
+    seekTo(positionMs + n * (1000 / (fps || 30)));
+  }
+
+  function stepSeconds(n: number) {
+    pauseForStep();
+    seekTo(positionMs + n * 1000);
   }
 
   // ---- Drag handling with global listeners ----
@@ -162,22 +250,51 @@
   <div class="ui-bottom">
     <div class="toolbar">
       <div class="transport">
+        <button type="button" title="Go to start (Home)" onclick={() => seekTo(0)}>
+          ⏮
+        </button>
         <button
           type="button"
-          title={playing ? "Pause" : "Play"}
+          title="Back one second (Shift+Left)"
+          onclick={() => stepSeconds(-1)}
+        >
+          ⏪
+        </button>
+        <button
+          type="button"
+          title="Back one frame (Left or comma)"
+          onclick={() => stepFrames(-1)}
+        >
+          ◀
+        </button>
+        <button
+          type="button"
+          title={playing ? "Pause (Space)" : "Play (Space)"}
           onclick={togglePlay}
         >
           {playing ? "⏸" : "▶"}
         </button>
         <button
           type="button"
-          title="Stop"
-          onclick={() => invoke("seek_to", { ms: 0 })}
+          title="Forward one frame (Right or period)"
+          onclick={() => stepFrames(1)}
         >
-          ⏹
+          ▶
+        </button>
+        <button
+          type="button"
+          title="Forward one second (Shift+Right)"
+          onclick={() => stepSeconds(1)}
+        >
+          ⏩
+        </button>
+        <button type="button" title="Go to end (End)" onclick={() => seekTo(durationMs)}>
+          ⏭
         </button>
       </div>
-      <div class="timecode">{formattedTime}</div>
+      <div class="timecode selectable" title="position / duration">
+        {formattedTime} <span class="dim">/ {formattedDuration}</span>
+      </div>
       <div class="spacer"></div>
       <div class="export">
         <input
@@ -242,13 +359,23 @@
             {#each ticks as t}
               <div class="tick" style="left: {t * pxPerSecond}px">
                 <div class="tick-mark"></div>
-                <div class="tick-label">{t}s</div>
+                <div class="tick-label">{formatTc(t, false)}</div>
               </div>
             {/each}
           </div>
 
-          {#each [0, 1, 2] as _}
-            <div class="lane"></div>
+          {#each [0, 1, 2] as lane}
+            <div class="lane">
+              {#if lane === 1}
+                <!-- The loaded media, as the span it occupies. Not an editable
+                     clip yet: the core has one video and no clip list. -->
+                <div class="clip" style="width: {totalSeconds * pxPerSecond}px">
+                  <span class="clip-label selectable">
+                    {formatTc(totalSeconds, false)}
+                  </span>
+                </div>
+              {/if}
+            </div>
           {/each}
 
           <div class="playhead" style="left: {playheadPx}px">
@@ -316,6 +443,7 @@
     color: var(--playhead);
     letter-spacing: 0.5px;
   }
+  .timecode .dim { color: var(--text-muted); }
 
   .spacer { flex: 1; }
 
@@ -434,6 +562,29 @@
     background: var(--bg-window);
   }
   .lane:nth-child(even) { background: #212121; }
+
+  /* The media span, drawn on its track. Uses the theme's clip colour, so when
+     real clips arrive they already look like this. */
+  .clip {
+    position: absolute;
+    top: 3px;
+    bottom: 3px;
+    left: 0;
+    background: var(--clip-video);
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    box-sizing: border-box;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+  }
+  .clip-label {
+    padding: 0 6px;
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    color: var(--text);
+    white-space: nowrap;
+  }
 
   .playhead {
     position: absolute;
