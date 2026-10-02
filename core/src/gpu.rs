@@ -42,14 +42,15 @@ pub struct Pipelines {
 /// Size of the `blit_uniform` contents: a single `vec4<f32>`.
 pub const BLIT_UNIFORM_SIZE: u64 = 16;
 
-/// Size of the grade parameters: four `f32`.
-pub const GRADE_UNIFORM_SIZE: u64 = 16;
+/// Size of the grade and transform parameters: two `vec4<f32>`.
+pub const GRADE_UNIFORM_SIZE: u64 = 32;
 
-/// The look this project shipped before any of it was adjustable.
+/// The look and placement this project shipped before either was adjustable.
 ///
-/// exposure, contrast, saturation, gamma. Kept as the buffer's initial contents
-/// so a project with no effects renders exactly as it always did.
-pub const GRADE_NEUTRAL: [f32; 4] = [0.0, 1.0, 1.4, 1.1];
+/// exposure, contrast, saturation, gamma, then scale, offset x, offset y, pad.
+/// Kept as the buffer's initial contents so a project with nothing set on it
+/// renders exactly as it always did.
+pub const GRADE_NEUTRAL: [f32; 8] = [0.0, 1.0, 1.4, 1.1, 1.0, 0.0, 0.0, 0.0];
 
 /// `(video_aspect, target_aspect, 0, 0)` for `blit.wgsl`.
 ///
@@ -63,7 +64,7 @@ pub fn letterbox_params(video_aspect: f32, target_w: u32, target_h: u32) -> [f32
 
 impl Pipelines {
     /// Update the grade parameters. Call before submitting the frame.
-    pub fn set_grade_params(&self, queue: &wgpu::Queue, params: [f32; 4]) {
+    pub fn set_grade_params(&self, queue: &wgpu::Queue, params: [f32; 8]) {
         queue.write_buffer(&self.grade_uniform, 0, bytemuck::cast_slice(&params));
     }
 

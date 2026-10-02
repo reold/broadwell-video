@@ -1115,15 +1115,19 @@ impl PreviewRenderer {
     /// Per frame rather than per clip change: sixteen bytes is nothing, and it
     /// leaves no state to keep in step when the timeline is cut.
     fn apply_grade_for_source(&self, source_ms: i64) {
-        let params = {
+        let (params, placement) = {
             let s = self.state.lock().unwrap();
             match s.clip_index_for_source(source_ms) {
-                Some(i) => s.clips[i].grade(),
-                None => Default::default(),
+                Some(i) => (s.clips[i].grade(), s.clips[i].transform),
+                None => (Default::default(), Default::default()),
             }
         };
-        self.pipelines
-            .set_grade_params(&self.host.queue, params.to_array());
+        // One uniform for both: the look and where the picture sits are read by
+        // the same three shaders and travel together.
+        let mut values = [0.0f32; 8];
+        values[..4].copy_from_slice(&params.to_array());
+        values[4..].copy_from_slice(&placement.to_array());
+        self.pipelines.set_grade_params(&self.host.queue, values);
     }
 
     /// The imported view of one encoder surface plane, created once per surface.

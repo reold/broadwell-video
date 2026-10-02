@@ -14,7 +14,31 @@
   /// variant. One variant today.
   type Effect = { Grade: GradeParams };
 
-  type Clip = { in_ms: number; out_ms: number; effects: Effect[] };
+  type Transform = { scale: number; offset_x: number; offset_y: number };
+
+  type Clip = {
+    in_ms: number;
+    out_ms: number;
+    effects: Effect[];
+    transform: Transform;
+  };
+
+  /// Where a clip's picture sits in the frame. Scale 1 fills it; anything
+  /// smaller leaves the rest black, which is what a layer underneath will
+  /// eventually show through.
+  const TRANSFORM_CONTROLS: {
+    k: keyof Transform;
+    label: string;
+    min: number;
+    max: number;
+    step: number;
+  }[] = [
+    { k: "scale", label: "Scale", min: 0.05, max: 3, step: 0.01 },
+    { k: "offset_x", label: "X", min: -1, max: 1, step: 0.01 },
+    { k: "offset_y", label: "Y", min: -1, max: 1, step: 0.01 },
+  ];
+
+  const TRANSFORM_DEFAULTS: Transform = { scale: 1, offset_x: 0, offset_y: 0 };
 
   /// Every icon is a path, never a character.
   ///
@@ -527,6 +551,13 @@
     invoke("remove_effect", { clip: selectedClip, at }).catch(() => {});
   }
 
+  function setTransformParam(key: keyof Transform, value: number) {
+    const clip = clips[selectedClip];
+    if (!clip) return;
+    const transform = { ...clip.transform, [key]: value };
+    invoke("set_transform", { clip: selectedClip, transform }).catch(() => {});
+  }
+
   function setGradeParam(at: number, key: keyof GradeParams, value: number) {
     const effect = clips[selectedClip]?.effects[at];
     if (!effect?.Grade) return;
@@ -815,6 +846,59 @@
           <span>Effects</span>
           <span class="dim">clip {selectedClip + 1}</span>
         </div>
+        {#if clips[selectedClip]}
+          <div class="effect">
+            <div class="effect-head">
+              <span>Transform</span>
+              <button
+                type="button"
+                title="Reset the transform"
+                disabled={clips[selectedClip].transform.scale === 1 &&
+                  clips[selectedClip].transform.offset_x === 0 &&
+                  clips[selectedClip].transform.offset_y === 0}
+                onclick={() =>
+                  invoke("set_transform", {
+                    clip: selectedClip,
+                    transform: TRANSFORM_DEFAULTS,
+                  }).catch(() => {})}
+              >
+                <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+                  <path d={ICON.reset} />
+                </svg>
+              </button>
+            </div>
+            {#each TRANSFORM_CONTROLS as control}
+              <label class="param">
+                <span class="param-name">{control.label}</span>
+                <input
+                  type="range"
+                  min={control.min}
+                  max={control.max}
+                  step={control.step}
+                  value={clips[selectedClip].transform[control.k]}
+                  oninput={(e) =>
+                    setTransformParam(control.k, Number(e.currentTarget.value))}
+                />
+                <span class="param-value">
+                  {clips[selectedClip].transform[control.k].toFixed(2)}
+                </span>
+                <button
+                  type="button"
+                  class="param-reset"
+                  title="Reset {control.label.toLowerCase()}"
+                  disabled={clips[selectedClip].transform[control.k] ===
+                    TRANSFORM_DEFAULTS[control.k]}
+                  onclick={() =>
+                    setTransformParam(control.k, TRANSFORM_DEFAULTS[control.k])}
+                >
+                  <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+                    <path d={ICON.reset} />
+                  </svg>
+                </button>
+              </label>
+            {/each}
+          </div>
+        {/if}
         {#each clips[selectedClip]?.effects ?? [] as effect, i}
           {#if effect.Grade}
             <div class="effect">

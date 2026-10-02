@@ -36,6 +36,37 @@ impl Default for GradeParams {
     }
 }
 
+/// Where a clip's picture sits in the frame.
+///
+/// This is the beginning of compositing: a clip is a picture that can be made
+/// smaller and moved, and whatever it does not cover is black until there is a
+/// layer underneath to show instead.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Transform {
+    /// 1.0 fills the frame; 0.5 is half as wide and half as tall.
+    pub scale: f32,
+    /// Offset from centre, as a fraction of the frame.
+    pub offset_x: f32,
+    pub offset_y: f32,
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
+        }
+    }
+}
+
+impl Transform {
+    /// What the third uniform vector carries.
+    pub fn to_array(&self) -> [f32; 4] {
+        [self.scale, self.offset_x, self.offset_y, 0.0]
+    }
+}
+
 /// One node of a clip's effect chain.
 ///
 /// One variant today. The chain is an ordered list rather than a single set of
@@ -114,6 +145,12 @@ pub enum Edit {
         before: Effect,
         after: Effect,
     },
+    /// Move or resize a clip's picture within the frame.
+    SetTransform {
+        clip: usize,
+        before: Transform,
+        after: Transform,
+    },
 }
 
 impl Edit {
@@ -123,6 +160,7 @@ impl Edit {
             in_ms: at_source_ms,
             out_ms: before.out_ms,
             effects: before.effects.clone(),
+            transform: before.transform,
         }
     }
 
@@ -193,6 +231,11 @@ impl Edit {
                     }
                 }
             }
+            Edit::SetTransform { clip, after, .. } => {
+                if let Some(c) = s.clips.get_mut(clip) {
+                    c.transform = after;
+                }
+            }
         }
         s.refresh_duration();
         if self.changes_look() {
@@ -206,7 +249,10 @@ impl Edit {
     pub fn changes_look(&self) -> bool {
         matches!(
             self,
-            Edit::InsertEffect { .. } | Edit::RemoveEffect { .. } | Edit::SetEffect { .. }
+            Edit::InsertEffect { .. }
+                | Edit::RemoveEffect { .. }
+                | Edit::SetEffect { .. }
+                | Edit::SetTransform { .. }
         )
     }
 
@@ -261,6 +307,15 @@ impl Edit {
                 before: after,
                 after: before,
             },
+            Edit::SetTransform {
+                clip,
+                before,
+                after,
+            } => Edit::SetTransform {
+                clip,
+                before: after,
+                after: before,
+            },
         }
     }
 
@@ -275,6 +330,10 @@ impl Edit {
                 Edit::SetEffect { clip: a, at: ai, .. },
                 Edit::SetEffect { clip: b, at: bi, .. },
             ) => a == b && ai == bi,
+            (
+                Edit::SetTransform { clip: a, .. },
+                Edit::SetTransform { clip: b, .. },
+            ) => a == b,
             _ => false,
         }
     }
@@ -306,6 +365,9 @@ pub struct Clip {
     /// This clip's own effect chain, applied in order.
     #[serde(default)]
     pub effects: Vec<Effect>,
+    /// Where this clip's picture sits in the frame.
+    #[serde(default)]
+    pub transform: Transform,
 }
 
 impl Clip {
@@ -314,6 +376,7 @@ impl Clip {
             in_ms,
             out_ms,
             effects: Vec::new(),
+            transform: Transform::default(),
         }
     }
 
@@ -746,5 +809,49 @@ mod edit_tests {
             after: trimmed,
         });
         assert_eq!(s.clips[1].grade().exposure, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+
+    #[test]
+    fn a_transform_undoes_to_where_it_was() {
+        let mut s = EditorState::new();
+        s.clips = vec![Clip::new(0, 1000)];
+        s.refresh_duration();
+        s.push_edit(Edit::SetTransform {
+            clip: 0,
+            before: Transform::default(),
+            after: Transform {
+                scale: 0.5,
+                offset_x: 0.25,
+                offset_y: -0.25,
+            },
+        });
+        assert_eq!(s.clips[0].transform.scale, 0.5);
+        assert_eq!(s.look_version, 1);
+        assert!(s.undo());
+        assert_eq!(s.clips[0].transform, Transform::default());
+        // A transform changes what a frame looks like, like any other grading
+        // edit, so the ring has to be told.
+        assert_eq!(s.look_version, 2);
+    }
+
+    #[test]
+    fn a_transform_survives_a_split() {
+        let mut s = EditorState::new();
+        s.clips = vec![Clip::new(0, 1000)];
+        s.clips[0].transform.scale = 0.5;
+        s.refresh_duration();
+        let before = s.clips[0].clone();
+        s.push_edit(Edit::SplitClip {
+            index: 0,
+            before,
+            at_source_ms: 400,
+        });
+        assert_eq!(s.clips[0].transform.scale, 0.5);
+        assert_eq!(s.clips[1].transform.scale, 0.5);
     }
 }

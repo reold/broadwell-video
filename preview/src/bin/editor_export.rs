@@ -112,6 +112,7 @@ impl Runner {
                         exposure,
                         ..Default::default()
                     })],
+                    transform: hwa_core::state::Transform::default(),
                 }];
                 s.refresh_duration();
                 println!("grade: exposure {exposure:+.2} EV on clip 1");
@@ -167,6 +168,23 @@ impl Runner {
         }
 
         let mut renderer = PreviewRenderer::new(host, &self.clip, format, state.clone())?;
+
+        // Optional: shrink the picture, so the black around it can be measured.
+        // After the renderer, because building it is what gives an untouched
+        // project its one clip covering the whole file.
+        if let Ok(spec) = std::env::var("HWA_TEST_SCALE") {
+            if let Ok(scale) = spec.trim().parse::<f32>() {
+                let mut s = state.lock().unwrap();
+                for clip in s.clips.iter_mut() {
+                    clip.transform.scale = scale;
+                }
+                s.look_version += 1;
+                println!(
+                    "transform: scale {scale} on {} clips",
+                    s.clips.len()
+                );
+            }
+        }
 
         if let Some(steps) = self.grade_steps {
             // Settle on a frame, then move a parameter the way a drag does. The

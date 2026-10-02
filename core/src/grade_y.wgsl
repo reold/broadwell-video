@@ -7,6 +7,10 @@ struct GradeParams {
     contrast: f32,
     saturation: f32,
     gamma: f32,
+    scale: f32,
+    offset_x: f32,
+    offset_y: f32,
+    pad: f32,
 };
 
 @group(0) @binding(3) var<uniform> params: GradeParams;
@@ -17,6 +21,15 @@ struct GradeParams {
 // grade_y.wgsl and grade_uv.wgsl into packed NV12. If the arithmetic here ever
 // differs between them the export stops matching what the preview showed, which
 // is the one class of bug this pipeline was built to avoid. Edit all three.
+// Where in the source this output pixel comes from, once the clip's transform
+// has been applied. Outside the source is black, which is what shows through
+// when a clip is made smaller than the frame.
+fn source_coord(out_pos: vec2<f32>, dims: vec2<f32>) -> vec2<f32> {
+    let centre = dims * 0.5;
+    let offset = vec2<f32>(params.offset_x, params.offset_y) * dims;
+    return (out_pos - centre - offset) / params.scale + centre;
+}
+
 fn graded(rgb_in: vec3<f32>) -> vec3<f32> {
     var c = rgb_in * exp2(params.exposure);
     c = (c - vec3<f32>(0.5)) * params.contrast + vec3<f32>(0.5);
@@ -27,8 +40,16 @@ fn graded(rgb_in: vec3<f32>) -> vec3<f32> {
 }
 
 fn graded_y_at(coord: vec2<i32>) -> f32 {
-    let y_raw = textureLoad(y_tex, coord, 0).r;
-    let uv_raw = textureLoad(uv_tex, vec2<i32>(coord.x / 2, coord.y / 2), 0);
+    let td = textureDimensions(y_tex);
+    let dims = vec2<f32>(f32(td.x), f32(td.y));
+    let source = source_coord(vec2<f32>(f32(coord.x), f32(coord.y)) + 0.5, dims);
+    if (source.x < 0.0 || source.y < 0.0 || source.x >= dims.x || source.y >= dims.y) {
+        // Black, in the limited range the encoder expects.
+        return 16.0 / 255.0;
+    }
+    let s = vec2<i32>(i32(source.x), i32(source.y));
+    let y_raw = textureLoad(y_tex, s, 0).r;
+    let uv_raw = textureLoad(uv_tex, vec2<i32>(s.x / 2, s.y / 2), 0);
 
     let y = (y_raw - 16.0 / 255.0) * (255.0 / 219.0);
     let u = (uv_raw.r - 128.0 / 255.0) * (255.0 / 224.0);

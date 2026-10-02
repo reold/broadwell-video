@@ -193,6 +193,30 @@ fn trim_clip(
     Ok(())
 }
 
+/// Move or resize a clip's picture within the frame.
+#[tauri::command]
+fn set_transform(
+    state: State<'_, SharedState>,
+    clip: usize,
+    transform: hwa_core::state::Transform,
+) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    let before = s
+        .clips
+        .get(clip)
+        .map(|c| c.transform)
+        .ok_or_else(|| format!("no clip {clip}"))?;
+    if before == transform {
+        return Ok(());
+    }
+    s.push_edit(hwa_core::state::Edit::SetTransform {
+        clip,
+        before,
+        after: transform,
+    });
+    Ok(())
+}
+
 /// Put a grade on a clip, so the effects panel has something to move.
 #[tauri::command]
 fn add_grade(state: State<'_, SharedState>, clip: usize) -> Result<(), String> {
@@ -864,6 +888,7 @@ pub fn run() {
             set_ui_height,
             move_clip,
             trim_clip,
+            set_transform,
             seek_to,
             default_export_path,
             start_export,
