@@ -37,10 +37,14 @@ present.
 
 ## Architecture
 
+For how this compares with what Apple's media stack and the editorial industry's
+standard timeline model actually do — and what that says about where this code
+should go next — see [`docs/architecture.md`](docs/architecture.md).
+
 ```
 H.264 file
   │
-  ├─ i965 VA-API decode ─────────► NV12 surface, in the video engine's pool
+  ├─ iHD VA-API decode ──────────► NV12 surface, in the video engine's pool
   │
   ├─ av_hwframe_map ─────────────► DRM_PRIME, two layers
   │      layer[0] Y  : DRM_FORMAT_R8   pitch = width
