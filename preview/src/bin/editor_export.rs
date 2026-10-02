@@ -93,6 +93,24 @@ impl Runner {
         let state = state::new_shared();
         state.lock().unwrap().video_path = self.clip.clone();
 
+        // Optional: put a grade on the first clip, so the export can be shown to
+        // depend on it. HWA_TEST_EXPOSURE=1.0 should brighten the file.
+        if let Ok(spec) = std::env::var("HWA_TEST_EXPOSURE") {
+            if let Ok(exposure) = spec.trim().parse::<f32>() {
+                let mut s = state.lock().unwrap();
+                s.clips = vec![hwa_core::state::Clip {
+                    in_ms: 0,
+                    out_ms: 3_600_000,
+                    effects: vec![hwa_core::state::Effect::Grade(hwa_core::state::GradeParams {
+                        exposure,
+                        ..Default::default()
+                    })],
+                }];
+                s.refresh_duration();
+                println!("grade: exposure {exposure:+.2} EV on clip 1");
+            }
+        }
+
         // Optional: cut the timeline up, so the clip walk is exercised. Source
         // ranges in milliseconds, comma separated:
         //   HWA_TEST_CLIPS="0-5000,10000-15000"
@@ -101,10 +119,10 @@ impl Runner {
                 .split(',')
                 .filter_map(|part| {
                     let (a, b) = part.split_once('-')?;
-                    Some(hwa_core::state::Clip {
-                        in_ms: a.trim().parse().ok()?,
-                        out_ms: b.trim().parse().ok()?,
-                    })
+                    Some(hwa_core::state::Clip::new(
+                        a.trim().parse().ok()?,
+                        b.trim().parse().ok()?,
+                    ))
                 })
                 .collect();
             if !clips.is_empty() {
@@ -195,6 +213,61 @@ impl Runner {
         );
         // eprintln, not println: iHD aborts somewhere in teardown on this
         // machine and buffered stdout is lost when it does.
+        // Content: the grade has to reach the pixels, and the only way to know
+        // is to look at them.
+        let stats = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-i",
+                &self.output,
+                "-vf",
+                "signalstats,metadata=print:file=-",
+                "-f",
+                "null",
+                "-",
+            ])
+            .output();
+        if let Ok(stats) = stats {
+            let text = String::from_utf8_lossy(&stats.stdout);
+            // The keys arrive in whatever order ffmpeg feels like -- YAVG comes
+            // before UAVG, which is not alphabetical -- so accumulate both and
+            // flush on the frame header rather than assuming sequence.
+            let (mut n, mut blank, mut luma_sum) = (0u64, 0u64, 0f64);
+            let (mut u, mut y) = (None::<f64>, None::<f64>);
+            for line in text.lines() {
+                if line.starts_with("frame:") {
+                    if let (Some(u), Some(y)) = (u.take(), y.take()) {
+                        n += 1;
+                        luma_sum += y;
+                        if u < 20.0 {
+                            blank += 1;
+                        }
+                    }
+                    continue;
+                }
+                if let Some(rest) = line.split("UAVG=").nth(1) {
+                    u = rest.trim().parse::<f64>().ok();
+                }
+                if let Some(rest) = line.split("YAVG=").nth(1) {
+                    y = rest.trim().parse::<f64>().ok();
+                }
+            }
+            if let (Some(u), Some(y)) = (u, y) {
+                n += 1;
+                luma_sum += y;
+                if u < 20.0 {
+                    blank += 1;
+                }
+            }
+            if n > 0 {
+                println!(
+                    "  content: {n} frames, {blank} with no chroma, mean luma {:.1}",
+                    luma_sum / n as f64
+                );
+            }
+        }
+
         match in_file {
             Some(n) if n >= written => {
                 eprintln!("  verified: wrote {written}, the file holds {n}")

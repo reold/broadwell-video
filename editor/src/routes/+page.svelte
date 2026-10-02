@@ -3,7 +3,31 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 
-  type Clip = { in_ms: number; out_ms: number };
+  type GradeParams = {
+    exposure: number;
+    contrast: number;
+    saturation: number;
+    gamma: number;
+  };
+
+  /// The Rust enum serialises as an externally tagged object, one key per
+  /// variant. One variant today.
+  type Effect = { Grade: GradeParams };
+
+  type Clip = { in_ms: number; out_ms: number; effects: Effect[] };
+
+  const GRADE_CONTROLS: {
+    k: keyof GradeParams;
+    label: string;
+    min: number;
+    max: number;
+    step: number;
+  }[] = [
+    { k: "exposure", label: "Exposure", min: -2, max: 2, step: 0.05 },
+    { k: "contrast", label: "Contrast", min: 0, max: 2, step: 0.02 },
+    { k: "saturation", label: "Saturation", min: 0, max: 3, step: 0.05 },
+    { k: "gamma", label: "Gamma", min: 0.2, max: 3, step: 0.05 },
+  ];
 
   type StateSnapshot = {
     playing: boolean;
@@ -11,6 +35,8 @@
     duration_ms: number;
     fps: number;
     clips: Clip[];
+    undo_depth: number;
+    redo_depth: number;
   };
 
   type ExportProgress = {
@@ -35,6 +61,8 @@
 
   let clips = $state<Clip[]>([]);
   let selectedClip = $state(0);
+  let undoDepth = $state(0);
+  let redoDepth = $state(0);
   let positionMs = $state(0);
   let durationMs = $state(60_000);
   let playing = $state(true);
@@ -95,6 +123,8 @@
       playing = s.playing;
       if (s.fps > 0) fps = s.fps;
       clips = s.clips ?? [];
+      undoDepth = s.undo_depth ?? 0;
+      redoDepth = s.redo_depth ?? 0;
     });
 
     invoke<string>("default_export_path").then((p) => {
@@ -110,6 +140,8 @@
       playing = s.playing;
       if (s.fps > 0) fps = s.fps;
       clips = s.clips ?? [];
+      undoDepth = s.undo_depth ?? 0;
+      redoDepth = s.redo_depth ?? 0;
     });
 
     const unlistenExport = listen<ExportProgress>("export_progress", (event) => {
@@ -134,6 +166,14 @@
         case " ":
           e.preventDefault();
           togglePlay();
+          break;
+        case "z":
+        case "Z":
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            if (e.shiftKey) redo();
+            else undo();
+          }
           break;
         case "ArrowLeft":
           e.preventDefault();
@@ -236,6 +276,36 @@
   function resetTimeline() {
     invoke("reset_timeline").catch(() => {});
     selectedClip = 0;
+  }
+
+  function undo() {
+    invoke("undo").catch(() => {});
+  }
+
+  function redo() {
+    invoke("redo").catch(() => {});
+  }
+
+  // ---- Effects ----
+  //
+  // The document is the source of truth: the sliders read the clip's effects
+  // from the snapshot and never hold their own copy, so what is drawn is what
+  // the renderer was told. Each move is an edit, and the spine folds a drag's
+  // worth of them into one undo step.
+
+  function addGrade() {
+    invoke("add_grade", { clip: selectedClip }).catch(() => {});
+  }
+
+  function removeEffect(at: number) {
+    invoke("remove_effect", { clip: selectedClip, at }).catch(() => {});
+  }
+
+  function setGradeParam(at: number, key: keyof GradeParams, value: number) {
+    const effect = clips[selectedClip]?.effects[at];
+    if (!effect?.Grade) return;
+    const params = { ...effect.Grade, [key]: value };
+    invoke("set_effect", { clip: selectedClip, at, params }).catch(() => {});
   }
 
   // ---- Drag handling with global listeners ----
@@ -368,6 +438,22 @@
       <div class="edit">
         <button
           type="button"
+          title="Undo (Ctrl+Z)"
+          onclick={undo}
+          disabled={undoDepth === 0}
+        >
+          ↶
+        </button>
+        <button
+          type="button"
+          title="Redo (Ctrl+Shift+Z)"
+          onclick={redo}
+          disabled={redoDepth === 0}
+        >
+          ↷
+        </button>
+        <button
+          type="button"
           title="Split the clip under the playhead"
           onclick={splitAtPlayhead}
         >
@@ -452,6 +538,43 @@
           </div>
         </div>
       </div>
+
+      <div class="effects">
+        <div class="effects-head">
+          <span>Effects</span>
+          <span class="dim">clip {selectedClip + 1}</span>
+        </div>
+        {#each clips[selectedClip]?.effects ?? [] as effect, i}
+          {#if effect.Grade}
+            <div class="effect">
+              <div class="effect-head">
+                <span>Grade</span>
+                <button type="button" title="Remove this effect" onclick={() => removeEffect(i)}>
+                  ×
+                </button>
+              </div>
+              {#each GRADE_CONTROLS as control}
+                <label class="param">
+                  <span class="param-name">{control.label}</span>
+                  <input
+                    type="range"
+                    min={control.min}
+                    max={control.max}
+                    step={control.step}
+                    value={effect.Grade[control.k]}
+                    oninput={(e) =>
+                      setGradeParam(i, control.k, Number(e.currentTarget.value))}
+                  />
+                  <span class="param-value">{effect.Grade[control.k].toFixed(2)}</span>
+                </label>
+              {/each}
+            </div>
+          {/if}
+        {/each}
+        <button type="button" class="add-effect" onclick={addGrade} disabled={clips.length === 0}>
+          Add grade
+        </button>
+      </div>
     </div>
   </div>
 </div>
@@ -515,6 +638,72 @@
   .timecode .dim { color: var(--text-muted); }
 
   .spacer { flex: 1; }
+
+  .effects {
+    width: 228px;
+    border-left: 1px solid var(--border);
+    background: var(--bg-panel);
+    padding: 6px 8px;
+    overflow-y: auto;
+    font-size: var(--font-size-sm);
+  }
+  .effects-head {
+    display: flex;
+    justify-content: space-between;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    font-size: var(--font-size-xs);
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .effects-head .dim { color: var(--text-muted); text-transform: none; }
+  .effect {
+    background: var(--bg-window);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--clip-effect);
+    border-radius: 3px;
+    padding: 6px 8px;
+    margin-bottom: 6px;
+  }
+  .effect-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    color: var(--text);
+    margin-bottom: 4px;
+  }
+  .effect-head button {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    padding: 0 2px;
+  }
+  .effect-head button:hover { color: var(--playhead); }
+  .param {
+    display: grid;
+    grid-template-columns: 64px 1fr 34px;
+    align-items: center;
+    gap: 6px;
+    margin: 2px 0;
+  }
+  .param-name { color: var(--text-dim); }
+  .param-value { font-family: var(--font-mono); color: var(--text); text-align: right; }
+  .param input[type="range"] { width: 100%; }
+  .add-effect {
+    width: 100%;
+    background: var(--bg-widget);
+    border: 1px solid var(--border);
+    color: var(--text);
+    height: 24px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: var(--font-size-sm);
+  }
+  .add-effect:hover:not(:disabled) { background: var(--bg-hover); }
+  .add-effect:disabled { color: var(--text-muted); cursor: default; }
 
   .edit { display: flex; gap: 6px; align-items: center; margin-right: 12px; }
   .edit button {

@@ -35,10 +35,21 @@ pub struct Pipelines {
 
     /// Letterbox parameters: x = video aspect (w/h), y = target aspect (w/h).
     pub blit_uniform: wgpu::Buffer,
+    /// The grade parameters, shared by the preview and export grade shaders.
+    pub grade_uniform: wgpu::Buffer,
 }
 
 /// Size of the `blit_uniform` contents: a single `vec4<f32>`.
 pub const BLIT_UNIFORM_SIZE: u64 = 16;
+
+/// Size of the grade parameters: four `f32`.
+pub const GRADE_UNIFORM_SIZE: u64 = 16;
+
+/// The look this project shipped before any of it was adjustable.
+///
+/// exposure, contrast, saturation, gamma. Kept as the buffer's initial contents
+/// so a project with no effects renders exactly as it always did.
+pub const GRADE_NEUTRAL: [f32; 4] = [0.0, 1.0, 1.4, 1.1];
 
 /// `(video_aspect, target_aspect, 0, 0)` for `blit.wgsl`.
 ///
@@ -51,6 +62,11 @@ pub fn letterbox_params(video_aspect: f32, target_w: u32, target_h: u32) -> [f32
 }
 
 impl Pipelines {
+    /// Update the grade parameters. Call before submitting the frame.
+    pub fn set_grade_params(&self, queue: &wgpu::Queue, params: [f32; 4]) {
+        queue.write_buffer(&self.grade_uniform, 0, bytemuck::cast_slice(&params));
+    }
+
     /// Update the letterbox parameters. Call before submitting the frame.
     pub fn set_letterbox(
         &self,
@@ -126,6 +142,19 @@ fn make_yuv_grade_bgl(
                     access: wgpu::StorageTextureAccess::WriteOnly,
                     format: storage_format,
                     view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+            // The grade parameters. One layout for all three grade shaders, so
+            // the preview and the export cannot drift apart without failing to
+            // build.
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(GRADE_UNIFORM_SIZE),
                 },
                 count: None,
             },
@@ -375,6 +404,15 @@ pub fn build_pipelines(
     });
 
     // Letterbox parameters, rewritten every frame from the live surface size.
+    let grade_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("grade-uniform"),
+        size: GRADE_UNIFORM_SIZE,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    host.queue
+        .write_buffer(&grade_uniform, 0, bytemuck::cast_slice(&GRADE_NEUTRAL));
+
     let blit_uniform = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("blit-uniform"),
         size: BLIT_UNIFORM_SIZE,
@@ -404,6 +442,7 @@ pub fn build_pipelines(
         blit_bgl,
         blit_sampler,
         blit_uniform,
+        grade_uniform,
         noop_pipeline,
         noop_bgl,
         ping_a_texture,

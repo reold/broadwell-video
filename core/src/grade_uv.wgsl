@@ -2,6 +2,30 @@
 @group(0) @binding(1) var uv_tex: texture_2d<f32>;
 @group(0) @binding(2) var out_uv: texture_storage_2d<r32uint, write>;
 
+struct GradeParams {
+    exposure: f32,
+    contrast: f32,
+    saturation: f32,
+    gamma: f32,
+};
+
+@group(0) @binding(3) var<uniform> params: GradeParams;
+
+// The grade, in one place, textually identical in all three grade shaders.
+//
+// The preview draws through grade.wgsl into RGBA and the export through
+// grade_y.wgsl and grade_uv.wgsl into packed NV12. If the arithmetic here ever
+// differs between them the export stops matching what the preview showed, which
+// is the one class of bug this pipeline was built to avoid. Edit all three.
+fn graded(rgb_in: vec3<f32>) -> vec3<f32> {
+    var c = rgb_in * exp2(params.exposure);
+    c = (c - vec3<f32>(0.5)) * params.contrast + vec3<f32>(0.5);
+    let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    c = mix(vec3<f32>(luma), c, params.saturation);
+    c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    return pow(c, vec3<f32>(1.0 / params.gamma));
+}
+
 fn avg_y_at(uv_coord: vec2<i32>) -> f32 {
     let x0 = uv_coord.x * 2;
     let y0 = uv_coord.y * 2;
@@ -25,12 +49,7 @@ fn graded_cbcr_at_uv(uv_coord: vec2<i32>) -> vec2<f32> {
     let b = y + 1.8556 * u;
 
     let rgb = clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
-    let luma = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let saturated = mix(vec3<f32>(luma), rgb, 1.4);
-    let gd = pow(
-        clamp(saturated, vec3<f32>(0.0), vec3<f32>(1.0)),
-        vec3<f32>(1.0 / 1.1),
-    );
+    let gd = graded(rgb);
 
     let cb = -0.1146 * gd.r - 0.3854 * gd.g + 0.5000 * gd.b;
     let cr = 0.5000 * gd.r - 0.4542 * gd.g - 0.0458 * gd.b;

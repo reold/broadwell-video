@@ -1,5 +1,236 @@
 use std::sync::{Arc, Mutex};
 
+/// The grade's parameters, in the order they are applied.
+///
+/// Defaults reproduce the look this project shipped before any of it was
+/// adjustable: saturation 1.4 and a gamma of 1.1. An unedited project therefore
+/// renders exactly as it used to, which is the property that makes it safe to
+/// route every frame through this.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GradeParams {
+    /// Stops, applied as a power of two. 0 is unchanged.
+    pub exposure: f32,
+    /// Around a mid grey pivot. 1 is unchanged.
+    pub contrast: f32,
+    /// Toward luma. 1 is unchanged.
+    pub saturation: f32,
+    /// Applied as `pow(c, 1/gamma)`. 1 is unchanged.
+    pub gamma: f32,
+}
+
+impl GradeParams {
+    /// The four floats the shaders read, in declaration order.
+    pub fn to_array(&self) -> [f32; 4] {
+        [self.exposure, self.contrast, self.saturation, self.gamma]
+    }
+}
+
+impl Default for GradeParams {
+    fn default() -> Self {
+        Self {
+            exposure: 0.0,
+            contrast: 1.0,
+            saturation: 1.4,
+            gamma: 1.1,
+        }
+    }
+}
+
+/// One node of a clip's effect chain.
+///
+/// One variant today. The chain is an ordered list rather than a single set of
+/// fields because the order is the thing that stops being obvious the moment a
+/// second kind of node exists.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Effect {
+    Grade(GradeParams),
+}
+
+impl Effect {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Effect::Grade(_) => "Grade",
+        }
+    }
+}
+
+/// An edit, and its own inverse.
+///
+/// Every change to the document goes through one of these so it can be undone,
+/// and `invert` never reads the document: each variant carries what its inverse
+/// needs. That keeps undo correct when other edits have landed since.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Edit {
+    /// Cut a clip in two. `before` is the clip as it was, so the inverse can
+    /// name the tail it is about to remove.
+    SplitClip {
+        index: usize,
+        before: Clip,
+        at_source_ms: i64,
+    },
+    /// Put a split back together: restore the head and drop the tail.
+    ///
+    /// A split is not undone by removing the tail alone -- the head's out point
+    /// was moved by the split and has to move back, which is what `before`
+    /// carries.
+    MergeClip {
+        index: usize,
+        before: Clip,
+        at_source_ms: i64,
+    },
+    InsertClip {
+        index: usize,
+        clip: Clip,
+    },
+    DeleteClip {
+        index: usize,
+        before: Clip,
+    },
+    InsertEffect {
+        clip: usize,
+        at: usize,
+        effect: Effect,
+    },
+    RemoveEffect {
+        clip: usize,
+        at: usize,
+        effect: Effect,
+    },
+    SetEffect {
+        clip: usize,
+        at: usize,
+        before: Effect,
+        after: Effect,
+    },
+}
+
+impl Edit {
+    /// The tail a split produces.
+    fn split_tail(before: &Clip, at_source_ms: i64) -> Clip {
+        Clip {
+            in_ms: at_source_ms,
+            out_ms: before.out_ms,
+            effects: before.effects.clone(),
+        }
+    }
+
+    pub fn apply(&self, s: &mut EditorState) {
+        match self.clone() {
+            Edit::SplitClip {
+                index,
+                before,
+                at_source_ms,
+            } => {
+                if s.clips.get(index).is_some()
+                    && at_source_ms > before.in_ms
+                    && at_source_ms < before.out_ms
+                {
+                    let mut head = before.clone();
+                    head.out_ms = at_source_ms;
+                    s.clips[index] = head;
+                    s.clips.insert(index + 1, Edit::split_tail(&before, at_source_ms));
+                }
+            }
+            Edit::MergeClip { index, before, .. } => {
+                if index + 1 < s.clips.len() {
+                    s.clips.remove(index + 1);
+                }
+                if index < s.clips.len() {
+                    s.clips[index] = before.clone();
+                }
+            }
+            Edit::InsertClip { index, clip } => {
+                let at = index.min(s.clips.len());
+                s.clips.insert(at, clip);
+            }
+            Edit::DeleteClip { index, .. } => {
+                if index < s.clips.len() {
+                    s.clips.remove(index);
+                }
+            }
+            Edit::InsertEffect { clip, at, effect } => {
+                if let Some(c) = s.clips.get_mut(clip) {
+                    let at = at.min(c.effects.len());
+                    c.effects.insert(at, effect);
+                }
+            }
+            Edit::RemoveEffect { clip, at, .. } => {
+                if let Some(c) = s.clips.get_mut(clip) {
+                    if at < c.effects.len() {
+                        c.effects.remove(at);
+                    }
+                }
+            }
+            Edit::SetEffect {
+                clip, at, after, ..
+            } => {
+                if let Some(c) = s.clips.get_mut(clip) {
+                    if let Some(slot) = c.effects.get_mut(at) {
+                        *slot = after;
+                    }
+                }
+            }
+        }
+        s.refresh_duration();
+    }
+
+    pub fn invert(&self) -> Edit {
+        match self.clone() {
+            Edit::SplitClip {
+                index,
+                before,
+                at_source_ms,
+            } => Edit::MergeClip {
+                index,
+                before,
+                at_source_ms,
+            },
+            Edit::MergeClip {
+                index,
+                before,
+                at_source_ms,
+            } => Edit::SplitClip {
+                index,
+                before,
+                at_source_ms,
+            },
+            Edit::InsertClip { index, clip } => Edit::DeleteClip {
+                index,
+                before: clip,
+            },
+            Edit::DeleteClip { index, before } => Edit::InsertClip { index, clip: before },
+            Edit::InsertEffect { clip, at, effect } => Edit::RemoveEffect { clip, at, effect },
+            Edit::RemoveEffect { clip, at, effect } => Edit::InsertEffect { clip, at, effect },
+            Edit::SetEffect {
+                clip,
+                at,
+                before,
+                after,
+            } => Edit::SetEffect {
+                clip,
+                at,
+                before: after,
+                after: before,
+            },
+        }
+    }
+
+    /// Whether a new edit should fold into the one before it.
+    ///
+    /// Dragging a slider produces an edit per pointer move. Without this the undo
+    /// stack fills with the drag's intermediate states and a single undo goes
+    /// back one pixel.
+    pub fn coalesces_with(&self, other: &Edit) -> bool {
+        match (self, other) {
+            (
+                Edit::SetEffect { clip: a, at: ai, .. },
+                Edit::SetEffect { clip: b, at: bi, .. },
+            ) => a == b && ai == bi,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 pub struct StateSnapshot {
     pub playing: bool,
@@ -8,6 +239,9 @@ pub struct StateSnapshot {
     pub fps: f64,
     /// The timeline, in order, as source ranges of the loaded file.
     pub clips: Vec<Clip>,
+    /// How many edits can be undone and redone, so the UI can grey its buttons.
+    pub undo_depth: usize,
+    pub redo_depth: usize,
 }
 
 /// One segment of the loaded file, in source milliseconds.
@@ -16,10 +250,33 @@ pub struct StateSnapshot {
 /// matter of changing the list. Clips from *different* files would need a
 /// decoder per file and are not modelled here: the source is one file, and this
 /// says which parts of it play, in what order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Clip {
     pub in_ms: i64,
     pub out_ms: i64,
+    /// This clip's own effect chain, applied in order.
+    #[serde(default)]
+    pub effects: Vec<Effect>,
+}
+
+impl Clip {
+    pub fn new(in_ms: i64, out_ms: i64) -> Self {
+        Self {
+            in_ms,
+            out_ms,
+            effects: Vec::new(),
+        }
+    }
+
+    /// The grade for this clip, or the default look if it has none.
+    pub fn grade(&self) -> GradeParams {
+        self.effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Grade(p) => Some(*p),
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl Clip {
@@ -51,6 +308,9 @@ pub struct EditorState {
     pub clips: Vec<Clip>,
     /// The export in flight or the last one to finish.
     pub export: Option<ExportJob>,
+    /// Edits that can be undone, oldest first, and edits that can be redone.
+    undo: Vec<Edit>,
+    redo: Vec<Edit>,
 }
 
 /// Where an export has got to.
@@ -116,15 +376,69 @@ impl EditorState {
             video_path: String::new(),
             clips: Vec::new(),
             export: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
         }
+    }
+
+    /// Apply an edit, and remember how to undo it.
+    ///
+    /// A repeated `SetEffect` on the same node folds into the one before it, so a
+    /// slider drag is one undo step rather than a hundred.
+    pub fn push_edit(&mut self, edit: Edit) {
+        let folded = match (self.undo.last_mut(), &edit) {
+            (Some(prev), Edit::SetEffect { after, .. }) if prev.coalesces_with(&edit) => {
+                if let Edit::SetEffect { after: slot, .. } = prev {
+                    *slot = *after;
+                }
+                true
+            }
+            _ => false,
+        };
+        if !folded {
+            self.undo.push(edit.clone());
+        }
+        edit.apply(self);
+        self.redo.clear();
+    }
+
+    pub fn undo(&mut self) -> bool {
+        if let Some(edit) = self.undo.pop() {
+            let inverse = edit.invert();
+            inverse.apply(self);
+            self.redo.push(edit);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn redo(&mut self) -> bool {
+        if let Some(edit) = self.redo.pop() {
+            edit.apply(self);
+            self.undo.push(edit);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
+    }
+
+    pub fn redo_depth(&self) -> usize {
+        self.redo.len()
+    }
+
+    /// The clip playing at a source position, if any.
+    pub fn clip_index_for_source(&self, source_ms: i64) -> Option<usize> {
+        self.clips.iter().position(|c| c.contains(source_ms))
     }
 
     /// One clip covering everything, for a file nobody has cut yet.
     pub fn reset_timeline(&mut self, source_duration_ms: i64) {
-        self.clips = vec![Clip {
-            in_ms: 0,
-            out_ms: source_duration_ms.max(0),
-        }];
+        self.clips = vec![Clip::new(0, source_duration_ms.max(0))];
         self.refresh_duration();
         self.position_ms = 0;
     }
@@ -193,6 +507,8 @@ impl EditorState {
             duration_ms: self.duration_ms,
             fps: self.fps,
             clips: self.clips.clone(),
+            undo_depth: self.undo.len(),
+            redo_depth: self.redo.len(),
         }
     }
 }
@@ -201,4 +517,99 @@ pub type SharedState = Arc<Mutex<EditorState>>;
 
 pub fn new_shared() -> SharedState {
     Arc::new(Mutex::new(EditorState::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn three_clips() -> EditorState {
+        let mut s = EditorState::new();
+        s.clips = vec![Clip::new(0, 1000), Clip::new(2000, 3000), Clip::new(5000, 6000)];
+        s.refresh_duration();
+        s
+    }
+
+    #[test]
+    fn splitting_and_undoing_leaves_the_timeline_as_it_was() {
+        let mut s = three_clips();
+        let before = s.clips.clone();
+        let clip = s.clips[0].clone();
+        s.push_edit(Edit::SplitClip {
+            index: 0,
+            before: clip,
+            at_source_ms: 400,
+        });
+        assert_eq!(s.clips.len(), 4);
+        assert_eq!(s.clips[0].out_ms, 400);
+        assert_eq!(s.clips[1].in_ms, 400);
+        assert_eq!(s.duration_ms, 3000);
+
+        assert!(s.undo());
+        assert_eq!(s.clips, before);
+        assert!(s.redo());
+        assert_eq!(s.clips.len(), 4);
+    }
+
+    #[test]
+    fn deleting_a_clip_and_undoing_puts_it_back_in_place() {
+        let mut s = three_clips();
+        let before = s.clips.clone();
+        let removed = s.clips[1].clone();
+        s.push_edit(Edit::DeleteClip {
+            index: 1,
+            before: removed,
+        });
+        assert_eq!(s.clips.len(), 2);
+        assert_eq!(s.duration_ms, 2000);
+        assert!(s.undo());
+        assert_eq!(s.clips, before);
+    }
+
+    #[test]
+    fn a_slider_drag_is_one_undo_step() {
+        let mut s = three_clips();
+        s.clips[0].effects = vec![Effect::Grade(GradeParams::default())];
+        for exposure in [0.25, 0.5, 0.9] {
+            let before = s.clips[0].effects[0];
+            s.push_edit(Edit::SetEffect {
+                clip: 0,
+                at: 0,
+                before,
+                after: Effect::Grade(GradeParams {
+                    exposure,
+                    ..Default::default()
+                }),
+            });
+        }
+        assert_eq!(s.clips[0].grade().exposure, 0.9);
+        // Three moves of one slider, and one thing to undo.
+        assert_eq!(s.undo_depth(), 1);
+        assert!(s.undo());
+        assert_eq!(s.clips[0].grade().exposure, 0.0);
+    }
+
+    #[test]
+    fn timeline_and_source_positions_map_both_ways() {
+        let s = three_clips();
+        // 1500 ms into the timeline is 500 ms into the second clip's source.
+        assert_eq!(s.source_for_timeline(1500), Some((1, 2500)));
+        // The round trip is the property that matters: any timeline position
+        // maps to a source position that maps back to it.
+        for timeline in [0, 500, 999, 1000, 1500, 2999] {
+            let (_, source) = s.source_for_timeline(timeline).expect("in range");
+            assert_eq!(s.timeline_for_source(source), timeline, "at {timeline}");
+        }
+        assert_eq!(s.timeline_for_source(2500), 1500);
+        // A gap in the source between clips is not on the timeline at all.
+        assert_eq!(s.clip_index_for_source(1500), None);
+    }
+
+    #[test]
+    fn the_default_grade_is_the_look_that_was_always_there() {
+        let g = GradeParams::default();
+        assert_eq!(g.to_array(), [0.0, 1.0, 1.4, 1.1]);
+        // A clip with no effects grades with the default.
+        assert_eq!(Clip::new(0, 100).grade(), g);
+    }
 }

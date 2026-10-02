@@ -247,6 +247,10 @@ impl App {
                                         &self.pipelines.out_view,
                                     ),
                                 },
+                                wgpu::BindGroupEntry {
+                                    binding: 3,
+                                    resource: self.pipelines.grade_uniform.as_entire_binding(),
+                                },
                             ],
                         });
                     {

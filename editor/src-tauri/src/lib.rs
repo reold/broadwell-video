@@ -66,21 +66,18 @@ fn split_at_playhead(state: State<'_, SharedState>) -> Result<(), String> {
     let Some((index, source)) = s.source_for_timeline(at) else {
         return Err("nothing to split".into());
     };
-    let clip = s.clips[index];
+    let before = s.clips[index].clone();
     // A cut at either end would make a zero length clip, which is only a way to
     // lose frames.
-    if source <= clip.in_ms || source >= clip.out_ms {
+    if source <= before.in_ms || source >= before.out_ms {
         return Err("the playhead is at a clip edge".into());
     }
-    s.clips[index].out_ms = source;
-    s.clips.insert(
-        index + 1,
-        hwa_core::state::Clip {
-            in_ms: source,
-            out_ms: clip.out_ms,
-        },
-    );
-    s.refresh_duration();
+    s.push_edit(hwa_core::state::Edit::SplitClip {
+        index,
+        before,
+        at_source_ms: source,
+    });
+    s.pending_seek_ms = Some(source);
     Ok(())
 }
 
@@ -91,8 +88,8 @@ fn delete_clip(state: State<'_, SharedState>, index: usize) -> Result<(), String
     if index >= s.clips.len() {
         return Err(format!("no clip {index}"));
     }
-    s.clips.remove(index);
-    s.refresh_duration();
+    let before = s.clips[index].clone();
+    s.push_edit(hwa_core::state::Edit::DeleteClip { index, before });
     if let Some((_, source)) = s.source_for_timeline(s.position_ms) {
         s.pending_seek_ms = Some(source);
     }
@@ -107,8 +104,72 @@ fn reset_timeline(state: State<'_, SharedState>) -> Result<(), String> {
     if whole <= 0 {
         return Err("no media loaded".into());
     }
+    // Deliberately not an edit: this is the state a project starts in, and
+    // undoing your way back into a cut timeline is not what anyone means by it.
     s.reset_timeline(whole);
     s.pending_seek_ms = Some(0);
+    Ok(())
+}
+
+#[tauri::command]
+fn undo(state: State<'_, SharedState>) -> bool {
+    state.lock().unwrap().undo()
+}
+
+#[tauri::command]
+fn redo(state: State<'_, SharedState>) -> bool {
+    state.lock().unwrap().redo()
+}
+
+/// Put a grade on a clip, so the effects panel has something to move.
+#[tauri::command]
+fn add_grade(state: State<'_, SharedState>, clip: usize) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    if clip >= s.clips.len() {
+        return Err(format!("no clip {clip}"));
+    }
+    let at = s.clips[clip].effects.len();
+    s.push_edit(hwa_core::state::Edit::InsertEffect {
+        clip,
+        at,
+        effect: hwa_core::state::Effect::Grade(hwa_core::state::GradeParams::default()),
+    });
+    Ok(())
+}
+
+/// Replace one effect. A slider drag calls this per pointer move, and the edit
+/// spine folds those into a single undo step.
+#[tauri::command]
+fn set_effect(
+    state: State<'_, SharedState>,
+    clip: usize,
+    at: usize,
+    params: hwa_core::state::GradeParams,
+) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    let before = *s
+        .clips
+        .get(clip)
+        .and_then(|c| c.effects.get(at))
+        .ok_or_else(|| format!("no effect {at} on clip {clip}"))?;
+    s.push_edit(hwa_core::state::Edit::SetEffect {
+        clip,
+        at,
+        before,
+        after: hwa_core::state::Effect::Grade(params),
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_effect(state: State<'_, SharedState>, clip: usize, at: usize) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    let effect = *s
+        .clips
+        .get(clip)
+        .and_then(|c| c.effects.get(at))
+        .ok_or_else(|| format!("no effect {at} on clip {clip}"))?;
+    s.push_edit(hwa_core::state::Edit::RemoveEffect { clip, at, effect });
     Ok(())
 }
 
@@ -636,6 +697,11 @@ pub fn run() {
             split_at_playhead,
             delete_clip,
             reset_timeline,
+            undo,
+            redo,
+            add_grade,
+            set_effect,
+            remove_effect,
             cancel_export,
         ])
         .setup(move |app| {

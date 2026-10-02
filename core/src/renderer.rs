@@ -838,6 +838,10 @@ impl PreviewRenderer {
                         binding: 2,
                         resource: wgpu::BindingResource::TextureView(&self.pipelines.out_y_view),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.pipelines.grade_uniform.as_entire_binding(),
+                    },
                 ],
             });
         let bg_uv = self
@@ -859,8 +863,14 @@ impl PreviewRenderer {
                         binding: 2,
                         resource: wgpu::BindingResource::TextureView(&self.pipelines.out_uv_view),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.pipelines.grade_uniform.as_entire_binding(),
+                    },
                 ],
             });
+
+        self.apply_grade_for_source(self.last_pts);
 
         let mut enc = self
             .host
@@ -980,6 +990,23 @@ impl PreviewRenderer {
         Ok(())
     }
 
+    /// Push the grade of the clip at this source position into the uniform the
+    /// three grade shaders read.
+    ///
+    /// Per frame rather than per clip change: sixteen bytes is nothing, and it
+    /// leaves no state to keep in step when the timeline is cut.
+    fn apply_grade_for_source(&self, source_ms: i64) {
+        let params = {
+            let s = self.state.lock().unwrap();
+            match s.clip_index_for_source(source_ms) {
+                Some(i) => s.clips[i].grade(),
+                None => Default::default(),
+            }
+        };
+        self.pipelines
+            .set_grade_params(&self.host.queue, params.to_array());
+    }
+
     /// The imported view of one encoder surface plane, created once per surface.
     ///
     /// Not once per frame: dropping an import destroys the VkImage wrapping the
@@ -1068,6 +1095,9 @@ impl PreviewRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // The clip's grade, before anything reads the uniform.
+        self.apply_grade_for_source(pts_ms);
+
         let mut enc =
             self.host
                 .device
@@ -1094,6 +1124,10 @@ impl PreviewRenderer {
                         wgpu::BindGroupEntry {
                             binding: 2,
                             resource: wgpu::BindingResource::TextureView(source),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.pipelines.grade_uniform.as_entire_binding(),
                         },
                     ],
                 });
