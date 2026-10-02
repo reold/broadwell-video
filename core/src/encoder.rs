@@ -82,9 +82,15 @@ const HANDOFF_HOLD: usize = 8;
 /// The child process this replaced was paced by its pipe: a write blocked when
 /// ffmpeg's input buffer filled. In process there is nothing to block on, and
 /// `avcodec_send_frame` keeps accepting long after the encoder has stopped
-/// keeping up, so the driver drops pictures. Measured in the editor with no
-/// limit at all: 900 frames written and 860 in the file, at 128 frames a second.
-const IN_FLIGHT_WINDOW: u64 = 4;
+/// keeping up, so the driver drops pictures.
+///
+/// One, and deliberately not more. Four was tried and is not enough: the editor
+/// at 128 frames a second still lost six pictures, which showed up as 894 packets
+/// for 900 frames. Waits are on packet arrival, so a deeper window only lets the
+/// driver queue work it will then discard. Serial costs nothing measurable --
+/// 91.1 fps against 89.8 with a window of four, both with 900 of 900 decodable --
+/// because the encoder's latency is not the limit; its queue is.
+const IN_FLIGHT_WINDOW: u64 = 1;
 
 fn describe(rc: i32) -> String {
     let mut buffer = [0i8; 256];
