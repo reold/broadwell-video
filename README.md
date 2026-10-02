@@ -15,17 +15,15 @@ pane, Blender-styled timeline in the bottom 300 px, play/pause/seek/scrub over
 Tauri IPC. The black bars either side of the video are the letterbox working —
 16:9 video in a 2.4:1 pane.
 
-![Cutting, grading and exporting a clip: dragging the playhead, splitting at the
-playhead, moving and trimming clips on the timeline, changing grade parameters
-and watching the picture follow, then exporting and getting 900 frames verified
-in the file](docs/editor-demo.gif)
+![The editor in use: clips on the timeline with the playhead moving, the
+preview pane, the grade and transform panels, and an export running to
+completion](docs/editor-demo.gif)
 
-Forty seconds of it actually being used, from [docs/editor-demo.gif](docs/editor-demo.gif):
-scrubbing, splitting a clip in two, dragging and trimming pieces on the timeline,
-adding a grade and moving its sliders with the frame on screen re-grading as they
-move, a transform that shrinks the picture inside the frame, undo, and an export
-that ends with the frame count verified against the file rather than against what
-it thought it wrote.
+Forty-eight seconds of it being used, from
+[docs/editor-demo.gif](docs/editor-demo.gif) — scrubbing, cutting clips, dragging
+and trimming them on the timeline, grading, moving and resizing the picture with
+the handles over the preview, undo, and an export that ends with its frame count
+verified against the file.
 
 ## The machine
 
