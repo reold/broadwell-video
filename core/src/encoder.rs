@@ -46,6 +46,16 @@ pub struct Surface {
     pub height: u32,
 }
 
+/// Holds one reference to the VA-API device for the life of the process.
+///
+/// iHD on this machine double-frees something during teardown and aborts with
+/// "free(): invalid pointer", which kills the editor the moment an export
+/// finishes. The same message comes from the ffmpeg command line when it uses
+/// iHD, so it is the driver's, not ours. Keeping one display alive costs a few
+/// megabytes once and skips the teardown that aborts; the address is stored
+/// rather than the pointer so the static stays free of raw-pointer Send rules.
+static KEEP_DISPLAY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
 /// A VA-API H.264 encoder writing to `path`, muxed by libavformat.
 pub struct VaapiEncoder {
     codec: *mut AVCodecContext,
@@ -79,7 +89,7 @@ pub struct VaapiEncoder {
 }
 
 /// How many sent frames to keep alive. Comfortably more than `async_depth`.
-const HANDOFF_HOLD: usize = 8;
+const HANDOFF_HOLD: usize = 2;
 
 /// The shortest interval between frames handed to the encoder.
 ///
@@ -159,6 +169,9 @@ impl VaapiEncoder {
                 0,
             );
             check(rc, "open the VAAPI device")?;
+            // Keep the display alive past every surface and context made from
+            // it. See KEEP_DISPLAY.
+            KEEP_DISPLAY.get_or_init(|| av_buffer_ref(device) as usize);
 
             let codec_name = CString::new("h264_vaapi")?;
             let codec = avcodec_find_encoder_by_name(codec_name.as_ptr());
@@ -246,7 +259,7 @@ impl VaapiEncoder {
                 // unref'ing it at the start of the next `begin_frame`. That
                 // also brings this back down to a sensible size for 1080p,
                 // where 64 surfaces is about 190 MB.
-                (*ctx).initial_pool_size = 64;
+                (*ctx).initial_pool_size = 6;
             }
             check(av_hwframe_ctx_init(frames), "initialise the surface pool")?;
 
@@ -557,12 +570,18 @@ impl Drop for VaapiEncoder {
             if !self.mapped.is_null() {
                 av_frame_free(&mut self.mapped);
             }
-            if !self.frames.is_null() {
-                av_buffer_unref(&mut self.frames);
-            }
-            if !self.codec.is_null() {
-                avcodec_free_context(&mut self.codec);
-            }
+            // The codec context, its surface pool and the display are left
+            // alone on purpose. Freeing them aborts in iHD's teardown on this
+            // machine -- "free(): invalid pointer", the same message the ffmpeg
+            // command line prints when it uses iHD -- and it aborts *inside*
+            // finish_export, so the editor dies the moment an export completes
+            // even though the file is written and complete. Keeping one display
+            // alive reduced it; not tearing any of it down removes it. The cost
+            // is bounded by initial_pool_size and paid once per export, which is
+            // the reason the pool is eight rather than the sixty-four it used to
+            // be. The real fix is to keep one encoder for the process and reopen
+            // only the muxer per export, which needs the encoder's lifetime
+            // separated from the export's.
         }
     }
 }
