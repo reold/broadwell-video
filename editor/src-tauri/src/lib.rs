@@ -40,6 +40,15 @@ fn toggle_play(state: State<'_, SharedState>) -> bool {
     s.playing
 }
 
+/// The frontend tells the renderer how tall the bottom strip is, in logical
+/// pixels, whenever a splitter moves.
+#[tauri::command]
+fn set_ui_height(size: State<'_, Arc<WindowSize>>, window: tauri::WebviewWindow, height: u32) {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    size.ui_h
+        .store(((height as f64) * scale).round() as u32, Ordering::Relaxed);
+}
+
 #[tauri::command]
 fn set_paused(state: State<'_, SharedState>, paused: bool) {
     state.lock().unwrap().playing = !paused;
@@ -47,6 +56,18 @@ fn set_paused(state: State<'_, SharedState>, paused: bool) {
 
 #[tauri::command]
 fn seek_to(state: State<'_, SharedState>, ms: i64) {
+    // An export is reading the decoder in its own order. A seek from the UI
+    // during one used to move the decoder under it, and the export wrote 1878
+    // frames of a 900 frame timeline.
+    if state
+        .lock()
+        .unwrap()
+        .export
+        .as_ref()
+        .is_some_and(|j| j.is_running() || j.stage == ExportStage::Verifying)
+    {
+        return;
+    }
     // Deliberately not logged: an unthrottled drag calls this on every pointer
     // move. The periodic stats line reports the seek rate instead.
     //
@@ -127,6 +148,12 @@ fn add_grade(state: State<'_, SharedState>, clip: usize) -> Result<(), String> {
     let mut s = state.lock().unwrap();
     if clip >= s.clips.len() {
         return Err(format!("no clip {clip}"));
+    }
+    // One grade per clip. A chain allows several nodes in principle, but two
+    // grades is never what someone meant, and the second one silently doing
+    // nothing to the second half of the picture is worse than refusing it.
+    if s.clips[clip].effects.iter().any(|e| matches!(e, hwa_core::state::Effect::Grade(_))) {
+        return Ok(());
     }
     let at = s.clips[clip].effects.len();
     s.push_edit(hwa_core::state::Edit::InsertEffect {
@@ -235,8 +262,8 @@ fn verify_export(
     clean_exit: bool,
     stamp: String,
 ) {
-    match hwa_core::export::count_output_frames(&output) {
-        Some(in_file) if in_file >= frames => {
+    match hwa_core::export::probe_output_frames(&output) {
+        hwa_core::export::OutputFrames::Counted(in_file) if in_file >= frames => {
             println!("[{stamp}] export verified: {in_file} frames in the file");
             if !clean_exit {
                 println!(
@@ -246,7 +273,7 @@ fn verify_export(
             }
             report_export(&state, ExportStage::Done, None);
         }
-        Some(in_file) => {
+        hwa_core::export::OutputFrames::Counted(in_file) => {
             let missing = frames.saturating_sub(in_file);
             println!(
                 "[{stamp}] WARNING: wrote {frames} frames but the file holds {in_file}; \
@@ -258,9 +285,19 @@ fn verify_export(
                 Some(format!("{in_file} of {frames} frames survived")),
             );
         }
-        None => {
+        hwa_core::export::OutputFrames::Unreadable => {
+            // ffprobe ran and could not open it. That is a broken export, and it
+            // used to be reported as a missing ffprobe and then as success.
+            println!("[{stamp}] WARNING: {output} cannot be read back; the container is broken");
+            report_export(
+                &state,
+                ExportStage::Failed,
+                Some("the exported file cannot be read back".into()),
+            );
+        }
+        hwa_core::export::OutputFrames::NoProbe => {
             println!(
-                "[{stamp}] export not verified (ffprobe unavailable); ffmpeg exit was {}",
+                "[{stamp}] export not verified (no ffprobe); ffmpeg exit was {}",
                 if clean_exit { "clean" } else { "abnormal" }
             );
             report_export(
@@ -303,6 +340,10 @@ fn export_progress(state: &SharedState) -> Option<hwa_core::state::ExportProgres
 struct WindowSize {
     w: AtomicU32,
     h: AtomicU32,
+    /// Height of the bottom strip, in physical pixels, as laid out by the
+    /// frontend. The video pane is the window minus this, so a splitter drag has
+    /// to reach the renderer or the subsurface sits at a size nothing matches.
+    ui_h: AtomicU32,
 }
 
 fn spawn_video(
@@ -365,6 +406,7 @@ fn spawn_video(
         size.h.store(win_size.height, Ordering::Relaxed);
         let mut scale = window.scale_factor().unwrap_or(1.0);
         let mut ui_height_px = (300.0 * scale) as u32;
+        size.ui_h.store(ui_height_px, Ordering::Relaxed);
         let preview_width = win_size.width.max(1);
         let preview_height = win_size.height.saturating_sub(ui_height_px).max(1);
 
@@ -452,9 +494,20 @@ fn spawn_video(
                     }
                 }
                 scale = window.scale_factor().unwrap_or(scale);
-                ui_height_px = (300.0 * scale) as u32;
+                // The frontend owns the layout now: it reports the strip height
+                // in logical pixels and this is the only place the scale is
+                // applied.
                 last_size_poll = Instant::now();
             }
+
+            // Read the strip height every frame: it changes while a splitter is
+            // being dragged, and the poll below only runs twice a second.
+            let reported = size.ui_h.load(Ordering::Relaxed);
+            ui_height_px = if reported > 0 {
+                reported
+            } else {
+                (300.0 * scale) as u32
+            };
 
             let win_w = size.w.load(Ordering::Relaxed);
             let win_h = size.h.load(Ordering::Relaxed);
@@ -541,9 +594,9 @@ fn spawn_video(
                                                 stamp,
                                             );
                                         });
-                                        // The stage the UI shows until the check
-                                        // answers: written, not yet verified.
-                                        report_export(&renderer.state, ExportStage::Running, None);
+                                        // Written, not yet checked. Not Running:
+                                        // that is what starts an export.
+                                        report_export(&renderer.state, ExportStage::Verifying, None);
                                     }
                                     Err(e) => report_export(
                                         &renderer.state,
@@ -757,6 +810,7 @@ pub fn run() {
             get_state,
             toggle_play,
             set_paused,
+            set_ui_height,
             seek_to,
             default_export_path,
             start_export,
@@ -793,7 +847,11 @@ pub fn run() {
             let size = Arc::new(WindowSize {
                 w: AtomicU32::new(0),
                 h: AtomicU32::new(0),
+                ui_h: AtomicU32::new(0),
             });
+            // The frontend reports the strip height through a command, so the
+            // same Arc has to be reachable from the IPC side.
+            app.manage(size.clone());
             if let Ok(s) = window.inner_size() {
                 size.w.store(s.width, Ordering::Relaxed);
                 size.h.store(s.height, Ordering::Relaxed);

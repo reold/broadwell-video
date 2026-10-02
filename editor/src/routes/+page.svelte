@@ -74,8 +74,15 @@
       const raw = localStorage.getItem("hwa.layout");
       if (!raw) return;
       const saved = JSON.parse(raw) as { bottom?: number; effects?: number };
-      if (saved.bottom) bottomHeight = saved.bottom;
-      if (saved.effects) effectsWidth = saved.effects;
+      // Clamped on the way in as well as out: a layout saved on a bigger screen
+      // pushed the timeline off the bottom of a smaller one, and a playhead that
+      // is off-screen looks like a playhead that has gone.
+      if (saved.bottom) {
+        bottomHeight = Math.max(120, Math.min(window.innerHeight - 160, saved.bottom));
+      }
+      if (saved.effects) {
+        effectsWidth = Math.max(160, Math.min(window.innerWidth - 320, saved.effects));
+      }
     } catch {
       // A layout that will not parse is not worth failing a startup over.
     }
@@ -112,6 +119,7 @@
       // The strip grows upward, so dragging up makes it taller.
       const next = resizeStart.bottom - (e.clientY - resizeStart.y);
       bottomHeight = Math.max(120, Math.min(window.innerHeight - 160, next));
+      reportLayout();
     } else if (resizing === "effects") {
       const next = resizeStart.effects - (e.clientX - resizeStart.x);
       effectsWidth = Math.max(160, Math.min(window.innerWidth - 320, next));
@@ -119,9 +127,19 @@
   }
 
   function endResize() {
-    if (resizing !== "none") saveLayout();
+    if (resizing !== "none") {
+      saveLayout();
+      reportLayout();
+    }
     resizing = "none";
     window.removeEventListener("pointermove", onResizeMove);
+  }
+
+  /// The video pane is a native subsurface that the backend sizes as the window
+  /// minus the bottom strip, so a splitter drag is invisible to it until it is
+  /// told. This is the telling.
+  function reportLayout() {
+    invoke("set_ui_height", { height: Math.round(bottomHeight) }).catch(() => {});
   }
   let undoDepth = $state(0);
   let redoDepth = $state(0);
@@ -179,7 +197,11 @@
   }
 
   onMount(() => {
+    // The webview's own context menu offers Reload and Inspect Element. Useful
+    // while developing, not what a right click on a clip should do.
+    window.addEventListener("contextmenu", (e) => e.preventDefault());
     loadLayout();
+    reportLayout();
 
     invoke<StateSnapshot>("get_state").then((s) => {
       positionMs = s.position_ms;
@@ -656,9 +678,16 @@
             </div>
           {/if}
         {/each}
-        <button type="button" class="add-effect" onclick={addGrade} disabled={clips.length === 0}>
-          Add grade
-        </button>
+        {#if !(clips[selectedClip]?.effects ?? []).some((effect) => effect.Grade)}
+          <button
+            type="button"
+            class="add-effect"
+            onclick={addGrade}
+            disabled={clips.length === 0}
+          >
+            Add grade
+          </button>
+        {/if}
       </div>
     </div>
   </div>

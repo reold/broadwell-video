@@ -341,6 +341,13 @@ pub struct EditorState {
 pub enum ExportStage {
     Idle,
     Running,
+    /// Written, not yet checked.
+    ///
+    /// Distinct from Running on purpose: the render loop starts an export when
+    /// the stage is Running, so reporting a finished-but-unverified export as
+    /// Running started a second one, which overwrote the file the first had just
+    /// written.
+    Verifying,
     Done,
     Failed,
     Cancelled,

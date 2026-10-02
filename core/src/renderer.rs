@@ -106,6 +106,9 @@ pub struct PreviewRenderer {
     pub map_failures: u64,
     /// The look version whose frames the ring holds.
     look_version_seen: u64,
+    /// Set when the current frame should be graded again with new parameters
+    /// rather than a new frame decoded for it.
+    pending_redraw: bool,
     pub map_warm_time: Duration,
     pub map_warm_count: u64,
     pub import_time: Duration,
@@ -262,6 +265,7 @@ impl PreviewRenderer {
             map_seek_count: 0,
             map_failures: 0,
             look_version_seen: 0,
+            pending_redraw: false,
             map_warm_time: Duration::ZERO,
             map_warm_count: 0,
             import_time: Duration::ZERO,
@@ -332,25 +336,43 @@ impl PreviewRenderer {
         let vw = self.ff.width;
         let vh = self.ff.height;
 
+        // A look change makes every graded frame in the ring stale, and it has to
+        // be noticed before the early-out below: a paused editor with nothing
+        // pending would otherwise sit on the old look until something else moved.
+        // The imported source frames are *not* dropped -- they are what the
+        // current frame is re-graded from, which is what makes a slider step show
+        // up as you drag it.
+        let look_changed = {
+            let version = self.state.lock().unwrap().look_version;
+            if version != self.look_version_seen {
+                self.look_version_seen = version;
+                self.ring_clear();
+                true
+            } else {
+                false
+            }
+        };
+
         // ---- Should we do anything this call? ----
         let (playing, had_seek) = {
             let s = self.state.lock().unwrap();
             (s.playing, s.pending_seek_ms.is_some())
         };
-        if !playing && !had_seek && self.prune_to_ms.is_none() && self.export.is_none() {
+        if !playing
+            && !had_seek
+            && self.prune_to_ms.is_none()
+            && self.export.is_none()
+            && !look_changed
+        {
             return Ok(FrameOutcome::Paused);
+        }
+        // Re-grade what is on screen rather than deciding a frame is needed.
+        if look_changed && !had_seek && self.export.is_none() {
+            self.pending_redraw = true;
         }
         let exporting = self.export.is_some();
 
-        // An effect changed, so every graded frame in the ring is stale.
-        {
-            let version = self.state.lock().unwrap().look_version;
-            if version != self.look_version_seen {
-                self.look_version_seen = version;
-                self.ring_clear();
-                self.texture_cache.clear();
-            }
-        }
+
 
         // ---- A resident frame may already cover this target ----
         //

@@ -349,6 +349,43 @@ impl Exporter {
 /// failing, and each loss takes the rest of its GOP with it. Counting what
 /// ended up in the container is the only honest check, and it costs one process
 /// spawn at the end of an export.
+/// What a frame count attempt found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFrames {
+    Counted(u64),
+    /// ffprobe ran and could not read the file: no moov atom, truncated, or not
+    /// a container at all. This is a failure, not an absence of information.
+    Unreadable,
+    /// No ffprobe on this machine.
+    NoProbe,
+}
+
+/// Count the video frames in a finished file.
+pub fn probe_output_frames(path: &str) -> OutputFrames {
+    let out = match Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=nw=1:nk=1",
+            path,
+        ])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return OutputFrames::NoProbe,
+    };
+    match String::from_utf8_lossy(&out.stdout).trim().parse() {
+        Ok(n) => OutputFrames::Counted(n),
+        Err(_) => OutputFrames::Unreadable,
+    }
+}
+
 pub fn count_output_frames(path: &str) -> Option<u64> {
     let out = Command::new("ffprobe")
         .args([
