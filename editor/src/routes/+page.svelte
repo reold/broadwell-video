@@ -14,7 +14,12 @@
   /// variant. One variant today.
   type Effect = { Grade: GradeParams };
 
-  type Transform = { scale: number; offset_x: number; offset_y: number };
+  type Transform = {
+    scale: number;
+    offset_x: number;
+    offset_y: number;
+    rotation: number;
+  };
 
   type Clip = {
     in_ms: number;
@@ -36,9 +41,15 @@
     { k: "scale", label: "Scale", min: 0.05, max: 3, step: 0.01 },
     { k: "offset_x", label: "X", min: -1, max: 1, step: 0.01 },
     { k: "offset_y", label: "Y", min: -1, max: 1, step: 0.01 },
+    { k: "rotation", label: "Rotate", min: -3.15, max: 3.15, step: 0.01 },
   ];
 
-  const TRANSFORM_DEFAULTS: Transform = { scale: 1, offset_x: 0, offset_y: 0 };
+  const TRANSFORM_DEFAULTS: Transform = {
+    scale: 1,
+    offset_x: 0,
+    offset_y: 0,
+    rotation: 0,
+  };
 
   /// Every icon is a path, never a character.
   ///
@@ -853,9 +864,11 @@
               <button
                 type="button"
                 title="Reset the transform"
-                disabled={clips[selectedClip].transform.scale === 1 &&
-                  clips[selectedClip].transform.offset_x === 0 &&
-                  clips[selectedClip].transform.offset_y === 0}
+                disabled={TRANSFORM_CONTROLS.every(
+                  (control) =>
+                    clips[selectedClip].transform[control.k] ===
+                    TRANSFORM_DEFAULTS[control.k]
+                )}
                 onclick={() =>
                   invoke("set_transform", {
                     clip: selectedClip,
@@ -1014,6 +1027,8 @@
   .timecode .dim { color: var(--text-muted); }
 
   .spacer { flex: 1; }
+
+  .lanes-inner { min-width: 100%; }
 
   .splitter-h {
     height: 4px;

@@ -68,3 +68,68 @@ button {
     font-family: inherit;
     font-size: inherit;
 }
+
+/* ---------------------------------------------------------------------------
+   No browser in an editor.
+
+   A webview comes with furniture that has nothing to do with cutting video: a
+   scrollbar with a light track, a blue focus ring on whatever was last clicked,
+   a text caret over things that are not text, and rubber-band overscroll at the
+   edges. None of it is ours and all of it is visible.
+--------------------------------------------------------------------------- */
+
+html,
+body {
+    overscroll-behavior: none;
+    overflow: hidden;
+}
+
+/* The scrollbars that remain are the ones inside panes, and they should look
+   like part of the theme rather than the operating system. */
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--bg-window);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--bg-hover);
+    border-radius: 5px;
+    border: 2px solid var(--bg-window);
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--border);
+}
+
+::-webkit-scrollbar-corner {
+    background: var(--bg-window);
+}
+
+/* Keyboard focus stays visible, because a keyboard user needs to see it.
+   Pointer focus does not, because a ring around the last thing clicked is
+   what a web page does. */
+:focus {
+    outline: none;
+}
+
+:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+}
+
+button,
+input[type="range"],
+[role="button"] {
+    cursor: default;
+}
+
+/* Images and links do not drag out of the window. */
+img,
+a {
+    -webkit-user-drag: none;
+    user-drag: none;
+}

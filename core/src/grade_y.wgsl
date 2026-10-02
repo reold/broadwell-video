@@ -10,7 +10,7 @@ struct GradeParams {
     scale: f32,
     offset_x: f32,
     offset_y: f32,
-    pad: f32,
+    rotation: f32,
 };
 
 @group(0) @binding(3) var<uniform> params: GradeParams;
@@ -27,7 +27,13 @@ struct GradeParams {
 fn source_coord(out_pos: vec2<f32>, dims: vec2<f32>) -> vec2<f32> {
     let centre = dims * 0.5;
     let offset = vec2<f32>(params.offset_x, params.offset_y) * dims;
-    return (out_pos - centre - offset) / params.scale + centre;
+    let d = out_pos - centre - offset;
+    // The inverse rotation: where in the source did this output pixel come
+    // from, given the picture was turned by `rotation` on its way out.
+    let c = cos(params.rotation);
+    let s = sin(params.rotation);
+    let turned = vec2<f32>(d.x * c + d.y * s, -d.x * s + d.y * c);
+    return turned / params.scale + centre;
 }
 
 fn graded(rgb_in: vec3<f32>) -> vec3<f32> {

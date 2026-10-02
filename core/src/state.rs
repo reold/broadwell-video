@@ -48,6 +48,9 @@ pub struct Transform {
     /// Offset from centre, as a fraction of the frame.
     pub offset_x: f32,
     pub offset_y: f32,
+    /// Clockwise, in radians. Rotating a picture smaller than the frame is how
+    /// you get a corner or an angle without black corners on a full frame.
+    pub rotation: f32,
 }
 
 impl Default for Transform {
@@ -56,14 +59,15 @@ impl Default for Transform {
             scale: 1.0,
             offset_x: 0.0,
             offset_y: 0.0,
+            rotation: 0.0,
         }
     }
 }
 
 impl Transform {
-    /// What the third uniform vector carries.
+    /// What the second uniform vector carries.
     pub fn to_array(&self) -> [f32; 4] {
-        [self.scale, self.offset_x, self.offset_y, 0.0]
+        [self.scale, self.offset_x, self.offset_y, self.rotation]
     }
 }
 
@@ -840,6 +844,7 @@ mod transform_tests {
                 scale: 0.5,
                 offset_x: 0.25,
                 offset_y: -0.25,
+                rotation: 0.25,
             },
         });
         assert_eq!(s.clips[0].transform.scale, 0.5);
