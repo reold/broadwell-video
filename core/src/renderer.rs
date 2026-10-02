@@ -197,6 +197,8 @@ impl PreviewRenderer {
             // number before anything has been cut, and quietly became the wrong
             // denominator for the progress bar and the export's frame estimate.
             s.source_duration_ms = ff.duration_ms;
+            s.video_width = vw;
+            s.video_height = vh;
             s.fps = ff.fps;
             s.video_path = video_path.to_string();
             if s.clips.is_empty() {

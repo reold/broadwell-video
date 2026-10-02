@@ -354,6 +354,11 @@ pub struct StateSnapshot {
     /// How many edits can be undone and redone, so the UI can grey its buttons.
     pub undo_depth: usize,
     pub redo_depth: usize,
+    /// The video's pixel dimensions. The preview draws it aspect-fit inside its
+    /// pane, so anything that wants to place an overlay on the picture has to
+    /// know the shape being fitted.
+    pub video_width: u32,
+    pub video_height: u32,
 }
 
 /// One segment of the loaded file, in source milliseconds.
@@ -422,6 +427,8 @@ pub struct EditorState {
     /// Length of that file. Not the same as `duration_ms`, which is the length
     /// of the *timeline* once clips have been cut, moved or removed.
     pub source_duration_ms: i64,
+    pub video_width: u32,
+    pub video_height: u32,
     /// The edit itself. Empty means the whole file, which is what a freshly
     /// opened clip gets.
     pub clips: Vec<Clip>,
@@ -510,6 +517,8 @@ impl EditorState {
             pending_seek_ms: None,
             video_path: String::new(),
             source_duration_ms: 0,
+            video_width: 0,
+            video_height: 0,
             clips: Vec::new(),
             export: None,
             undo: Vec::new(),
@@ -659,6 +668,8 @@ impl EditorState {
             clips: self.clips.clone(),
             undo_depth: self.undo.len(),
             redo_depth: self.redo.len(),
+            video_width: self.video_width,
+            video_height: self.video_height,
         }
     }
 }

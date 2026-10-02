@@ -101,6 +101,8 @@
     clips: Clip[];
     undo_depth: number;
     redo_depth: number;
+    video_width: number;
+    video_height: number;
   };
 
   type ExportProgress = {
@@ -125,6 +127,140 @@
 
   let clips = $state<Clip[]>([]);
   let selectedClip = $state(0);
+  let videoW = $state(0);
+  let videoH = $state(0);
+
+  // ---- Direct manipulation of the picture ----
+  //
+  // The video is drawn aspect-fit inside its pane, so the picture has two
+  // coordinate spaces: the pane's pixels, and the frame's fractions. Handles
+  // live in the first and the transform lives in the second; every gesture
+  // below is a conversion between them.
+  let paneEl: HTMLDivElement | undefined = $state();
+  let paneSize = $state({ w: 0, h: 0 });
+
+  /// Where the untouched video sits inside the pane.
+  let fit = $derived.by(() => {
+    const { w: pw, h: ph } = paneSize;
+    if (!pw || !ph || !videoW || !videoH) return null;
+    const scale = Math.min(pw / videoW, ph / videoH);
+    const w = videoW * scale;
+    const h = videoH * scale;
+    return { left: (pw - w) / 2, top: (ph - h) / 2, w, h };
+  });
+
+  /// Where the picture sits once the clip's transform has been applied. Given
+  /// the same numbers the shader uses, so the outline lands on the pixels.
+  let picture = $derived.by(() => {
+    if (!fit) return null;
+    const t = clips[selectedClip]?.transform ?? TRANSFORM_DEFAULTS;
+    const width = fit.w * t.scale;
+    const height = fit.h * t.scale;
+    const cx = fit.left + fit.w / 2 + t.offset_x * fit.w;
+    const cy = fit.top + fit.h / 2 + t.offset_y * fit.h;
+    return {
+      left: cx - width / 2,
+      top: cy - height / 2,
+      width,
+      height,
+      cx,
+      cy,
+      rotation: t.rotation,
+    };
+  });
+
+  let handleDrag = $state<null | {
+    mode: "move" | "rotate" | "nw" | "ne" | "se" | "sw";
+    x: number;
+    y: number;
+    start: Transform;
+    radius: number;
+    angle: number;
+    cx: number;
+    cy: number;
+  }>(null);
+
+  function beginHandleDrag(mode: "move" | "rotate" | "nw" | "ne" | "se" | "sw", e: PointerEvent) {
+    const clip = clips[selectedClip];
+    if (e.button !== 0 || !clip || !picture || !fit) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const dx = e.clientX - picture.cx;
+    const dy = e.clientY - picture.cy;
+    handleDrag = {
+      mode,
+      x: e.clientX,
+      y: e.clientY,
+      start: clip.transform,
+      radius: Math.max(1, Math.hypot(dx, dy)),
+      angle: Math.atan2(dy, dx),
+      cx: picture.cx,
+      cy: picture.cy,
+    };
+    window.addEventListener("pointermove", onHandleMove);
+    window.addEventListener("pointerup", endHandleDrag, { once: true });
+  }
+
+  function onHandleMove(e: PointerEvent) {
+    const drag = handleDrag;
+    if (!drag || !fit) return;
+    const t = drag.start;
+
+    if (drag.mode === "move") {
+      // The offset is applied before the rotation in the shader, so a pointer
+      // delta has to be turned back into the frame's axes before it means
+      // anything.
+      const dx = e.clientX - drag.x;
+      const dy = e.clientY - drag.y;
+      const c = Math.cos(-t.rotation);
+      const sn = Math.sin(-t.rotation);
+      const fx = (dx * c + dy * sn) / fit.w;
+      const fy = (-dx * sn + dy * c) / fit.h;
+      applyTransform({
+        ...t,
+        offset_x: clamp(t.offset_x + fx, -2, 2),
+        offset_y: clamp(t.offset_y + fy, -2, 2),
+      });
+      return;
+    }
+
+    if (drag.mode === "rotate") {
+      const a = Math.atan2(e.clientY - drag.cy, e.clientX - drag.cx);
+      let rotation = t.rotation + (a - drag.angle);
+      // Shift snaps to fifteen degrees, which is how you get a picture square
+      // to the frame without fighting the pointer.
+      if (e.shiftKey) {
+        const step = Math.PI / 12;
+        rotation = Math.round(rotation / step) * step;
+      }
+      applyTransform({ ...t, rotation });
+      return;
+    }
+
+    // A corner scales from the centre, so the aspect ratio is never in question.
+    const radius = Math.max(1, Math.hypot(e.clientX - drag.cx, e.clientY - drag.cy));
+    const scale = clamp((t.scale * radius) / drag.radius, 0.05, 5);
+    applyTransform({ ...t, scale });
+  }
+
+  function endHandleDrag() {
+    handleDrag = null;
+    window.removeEventListener("pointermove", onHandleMove);
+  }
+
+  function applyTransform(transform: Transform) {
+    invoke("set_transform", { clip: selectedClip, transform }).catch(() => {});
+  }
+
+  function clamp(v: number, lo: number, hi: number) {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  function measurePane() {
+    if (!paneEl) return;
+    const r = paneEl.getBoundingClientRect();
+    paneSize = { w: r.width, h: r.height };
+  }
 
   /// A clip drag in progress.
   ///
@@ -140,6 +276,10 @@
   }>(null);
 
   const EDGE_PX = 6;
+
+  /// Typed so the handle gesture keeps the literal union rather than widening
+  /// to `string`.
+  const CORNERS = ["nw", "ne", "se", "sw"] as const;
 
   // Panel sizes, remembered between runs. Blender's arrangement: every boundary
   // is somewhere the user can put it, and it stays put.
@@ -377,6 +517,12 @@
     window.addEventListener("contextmenu", (e) => e.preventDefault());
     loadLayout();
     reportLayout();
+    measurePane();
+    if (paneEl) {
+      const observer = new ResizeObserver(measurePane);
+      observer.observe(paneEl);
+      return () => observer.disconnect();
+    }
 
     invoke<StateSnapshot>("get_state").then((s) => {
       positionMs = s.position_ms;
@@ -386,6 +532,8 @@
       clips = s.clips ?? [];
       undoDepth = s.undo_depth ?? 0;
       redoDepth = s.redo_depth ?? 0;
+      videoW = s.video_width ?? 0;
+      videoH = s.video_height ?? 0;
     });
 
     invoke<string>("default_export_path").then((p) => {
@@ -403,6 +551,8 @@
       clips = s.clips ?? [];
       undoDepth = s.undo_depth ?? 0;
       redoDepth = s.redo_depth ?? 0;
+      videoW = s.video_width ?? 0;
+      videoH = s.video_height ?? 0;
     });
 
     const unlistenExport = listen<ExportProgress>("export_progress", (event) => {
@@ -624,7 +774,29 @@
 </script>
 
 <div class="timeline-root">
-  <div class="preview-spacer"></div>
+  <div class="preview-spacer" bind:this={paneEl}>
+    {#if picture && handleDrag === null}
+      <div
+        class="picture-frame"
+        style="left: {picture.left}px; top: {picture.top}px; width: {picture.width}px;                height: {picture.height}px; transform: rotate({picture.rotation}rad)"
+        onpointerdown={(e) => beginHandleDrag("move", e)}
+        role="presentation"
+      >
+        {#each CORNERS as corner}
+          <div
+            class="handle {corner}"
+            onpointerdown={(e) => beginHandleDrag(corner, e)}
+            role="presentation"
+          ></div>
+        {/each}
+        <div
+          class="handle rotate"
+          onpointerdown={(e) => beginHandleDrag("rotate", e)}
+          role="presentation"
+        ></div>
+      </div>
+    {/if}
+  </div>
 
   <div
     class="splitter-h"
@@ -982,6 +1154,46 @@
     flex: 1;
     min-height: 0;
     background: transparent;
+    position: relative;
+    overflow: hidden;
+  }
+
+  /* The outline of the picture, drawn where the shader puts it. Dragging the
+     middle moves it; a corner scales it; the grip above turns it. */
+  .picture-frame {
+    position: absolute;
+    border: 1px solid rgba(255, 255, 255, 0.55);
+    cursor: move;
+  }
+  .handle {
+    position: absolute;
+    width: 10px;
+    height: 10px;
+    margin: -5px 0 0 -5px;
+    background: var(--text);
+    border: 1px solid var(--bg-window);
+    border-radius: 2px;
+  }
+  .handle.nw { left: 0; top: 0; cursor: nwse-resize; }
+  .handle.ne { left: 100%; top: 0; cursor: nesw-resize; }
+  .handle.se { left: 100%; top: 100%; cursor: nwse-resize; }
+  .handle.sw { left: 0; top: 100%; cursor: nesw-resize; }
+  .handle.rotate {
+    left: 50%;
+    top: -22px;
+    margin-left: -5px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: grab;
+  }
+  .handle.rotate::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 100%;
+    width: 1px;
+    height: 12px;
+    background: rgba(255, 255, 255, 0.55);
   }
 
   .ui-bottom {
