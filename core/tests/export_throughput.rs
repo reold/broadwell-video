@@ -18,6 +18,7 @@ use hwa_core::encoder::VaapiEncoder;
 use hwa_core::export::Nv12Readback;
 use hwa_core::{ffmpeg, gpu};
 use std::os::fd::FromRawFd;
+use std::collections::HashMap;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -157,6 +158,13 @@ fn in_process_export_throughput() {
         drained: false,
     };
 
+    // Encoder surface imports are keyed by surface, like the renderer's cache:
+    // they must outlive the frame that made them, because destroying the VkImage
+    // wrapping a dma-buf while the encoder still reads that surface loses
+    // pictures. Decoder surfaces are left per frame, which is what the renderer's
+    // bounded frame cache does in effect.
+    let mut encoder_imports: HashMap<(std::os::fd::RawFd, u64), wgpu::Texture> = HashMap::new();
+
     let mut frames = 0u64;
     let (mut t_import, mut t_grade, mut t_handoff, mut t_send) = (
         Duration::ZERO,
@@ -222,27 +230,40 @@ fn in_process_export_throughput() {
 
         // The encoder lends the surface this frame is written into.
         let surface = encoder.begin_frame().expect("surface");
-        let dest_y = import_plane(
-            &host,
+        let mut dest_plane = |fd: std::os::fd::RawFd,
+                              info: hwa_core::encoder::Plane,
+                              size: dpi::PhysicalSize<u32>,
+                              format: wgpu::TextureFormat,
+                              map: &mut HashMap<(std::os::fd::RawFd, u64), wgpu::Texture>| {
+            map.entry((fd, info.offset))
+                .or_insert_with(|| {
+                    import_plane(
+                        &host,
+                        fd,
+                        info.fourcc,
+                        surface.modifier,
+                        info.offset,
+                        info.pitch,
+                        size,
+                        format,
+                        true,
+                    )
+                })
+                .clone()
+        };
+        let dest_y = dest_plane(
             surface.y_fd,
-            surface.y.fourcc,
-            surface.modifier,
-            surface.y.offset,
-            surface.y.pitch,
+            surface.y,
             dpi::PhysicalSize::new(vw, vh),
             wgpu::TextureFormat::R8Unorm,
-            true,
+            &mut encoder_imports,
         );
-        let dest_uv = import_plane(
-            &host,
+        let dest_uv = dest_plane(
             surface.uv_fd,
-            surface.uv.fourcc,
-            surface.modifier,
-            surface.uv.offset,
-            surface.uv.pitch,
+            surface.uv,
             dpi::PhysicalSize::new(vw / 2, vh / 2),
             wgpu::TextureFormat::Rg8Unorm,
-            true,
+            &mut encoder_imports,
         );
 
         let bg_y = host.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -281,6 +302,7 @@ fn in_process_export_throughput() {
                 },
             ],
         });
+
 
         let t = Instant::now();
         let mut enc = host

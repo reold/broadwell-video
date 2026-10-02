@@ -300,8 +300,36 @@ Two details worth knowing:
   build exposes decode only. A claim that iHD supports AVC encode only from
   Broxton onwards is **wrong**, and it is what made the hardware look finished.
 
-The driver is selected for the ffmpeg child only, so the decode path keeps
-whatever the system is configured for.
+The editor no longer uses a child process at all. `hwa_core::encoder` opens the
+VA-API H.264 encoder in-process with libavcodec, takes a surface from its own
+pool for each frame, and muxes the result with libavformat. The picture never
+reaches the CPU: the grade is copied into the encoder's surface through a
+staging buffer on the GPU, and `avcodec_send_frame` reads what the render engine
+wrote. Measured over 900 frames of 1080p30 in `core/tests/export_throughput`:
+
+| phase | readback path | in-process |
+|---|---|---|
+| grade + copies | 15.2 ms (readback) | **0.26 ms** |
+| handoff | — | 4.00 ms |
+| send | 3.7 ms (pipe write) | 6.33 ms |
+| total | 45.1 fps | **72.8 fps** |
+
+Two things make that work, and both were found by measurement rather than
+reasoning. The imports of the encoder's surfaces are **cached per surface, not
+made per frame**: destroying the VkImage that wraps a dma-buf while the encoder
+still holds the surface costs frames, and does so only at pipeline depth above
+one. And **every packet the encoder emits is muxed, including those flagged
+`AV_PKT_FLAG_DISCARD`** — at depth above one the first packet of the file, the
+IDR the whole first GOP references, carries that flag, and dropping it leaves a
+stream whose first decodable frame is thirty frames in.
+
+Pipeline depth is one picture. Depth two is *not* the throughput win it looks
+like: at 1080p it measured 48.8 fps with only 769 of 900 frames decodable, since
+the encoder drops a few input frames under that rate and each one costs its GOP.
+Depth one, with the imports cached, is both faster and complete.
+
+The `hwa-preview` reference binary keeps the subprocess path, so the old numbers
+stay reproducible. Its knobs are unchanged:
 
 | variable | default | why |
 |---|---|---|
@@ -310,11 +338,12 @@ whatever the system is configured for.
 | `HWA_EXPORT_X264_PRESET` | `ultrafast` | fallback encoder; 52 fps, 90 MB vs `veryfast`'s 21.9 fps, 55 MB |
 | `HWA_EXPORT_GOP` | `30` | with `-bf 0` a drop costs up to one GOP; measured, 186 pictures lost at `-g 30` against 45 at `-g 15` |
 
-Every export is **verified rather than assumed**: after ffmpeg exits,
-`ffprobe -count_frames` counts what is actually in the file, and a short count
+Every export is **verified rather than assumed**: `ffprobe -count_frames` counts
+what is actually in the file before the export is called done, and a short count
 is reported as a failure naming the cause. That check is what turned an
-unexplained "glitchy file" into a driver diagnosis, and it is what allows a
-correct export to be accepted from a process that exited abnormally.
+unexplained "glitchy file" into a driver diagnosis, and it is what keeps a
+zero-copy path honest — the phase timings above say nothing about whether the
+pictures arrived.
 
 ### The lesson worth keeping
 
