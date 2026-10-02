@@ -61,6 +61,8 @@ pub struct VaapiEncoder {
     /// Packets actually written to the container.
     muxed: u64,
     discarded: u64,
+    /// Waits that gave up because no packet came.
+    starved: u64,
     /// Frames sent to the encoder that it may still be holding.
     ///
     /// The VAAPI encoder works from surface ids, so releasing the AVFrame once
@@ -71,11 +73,30 @@ pub struct VaapiEncoder {
     /// frame at a time, at 30.7 ms of send per frame. Holding a reference keeps
     /// each surface out of the pool until the queue has moved past it.
     handoff: VecDeque<*mut AVFrame>,
+    /// When the previous frame was sent, for pacing.
+    last_send: Option<std::time::Instant>,
     finished: bool,
 }
 
 /// How many sent frames to keep alive. Comfortably more than `async_depth`.
 const HANDOFF_HOLD: usize = 8;
+
+/// The shortest interval between frames handed to the encoder.
+///
+/// The driver discards pictures when it is fed faster than it can encode, and
+/// the numbers say where that starts. Unpaced, the editor's flow runs at 124 fps
+/// and the file comes back with 881 packets for 900 frames; the throughput
+/// harness at 91 fps loses none. Pacing is cheaper than dropping: a cap of about
+/// seventy frames a second costs a little speed and keeps every picture, while
+/// the file that arrives short costs the whole export.
+const MIN_FRAME_PERIOD: std::time::Duration = std::time::Duration::from_micros(14_000);
+
+/// How long to wait for a packet before giving up and carrying on.
+///
+/// The wait exists to apply back-pressure, not to hang: if the driver has
+/// discarded this picture there is no packet coming, and spinning for one
+/// forever is worse than a short file.
+const WAIT_FOR_PACKET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How many pictures may be in the encoder at once before the caller waits.
 ///
@@ -265,7 +286,9 @@ impl VaapiEncoder {
                 stream_index: (*stream).index,
                 muxed: 0,
                 discarded: 0,
+                starved: 0,
                 handoff: VecDeque::new(),
+                last_send: None,
                 frames_written: 0,
                 finished: false,
             })
@@ -335,6 +358,14 @@ impl VaapiEncoder {
 
     /// Send the surface filled by the GPU and mux whatever the encoder emits.
     pub fn write_frame(&mut self) -> Result<()> {
+        // Pace to the fastest rate the driver has been measured to sustain.
+        if let Some(last) = self.last_send {
+            let elapsed = last.elapsed();
+            if elapsed < MIN_FRAME_PERIOD {
+                std::thread::sleep(MIN_FRAME_PERIOD - elapsed);
+            }
+        }
+        self.last_send = Some(std::time::Instant::now());
         unsafe {
             (*self.frame).pts = self.frames_written as i64;
             // Duration in the encoder's time base, so the muxer knows how long
@@ -382,6 +413,7 @@ impl VaapiEncoder {
     fn drain(&mut self, wait_for_one: bool) -> Result<bool> {
         unsafe {
             let mut muxed_any = false;
+            let waited = std::time::Instant::now();
             loop {
                 let rc = avcodec_receive_packet(self.codec, self.packet);
                 if rc == AVERROR_EOF {
@@ -391,7 +423,11 @@ impl VaapiEncoder {
                     if wait_for_one && !muxed_any {
                         // The encoder is still working. Nothing outside the
                         // driver can see its completion, so this is a short
-                        // sleep rather than a fence.
+                        // sleep rather than a fence -- but only for so long.
+                        if waited.elapsed() > WAIT_FOR_PACKET {
+                            self.starved += 1;
+                            break;
+                        }
                         std::thread::sleep(std::time::Duration::from_micros(200));
                         continue;
                     }
@@ -402,16 +438,20 @@ impl VaapiEncoder {
                 // treating every negative return as "nothing ready".
                 check(rc, "receive an encoded packet")?;
                 if (*self.packet).flags & AV_PKT_FLAG_DISCARD as i32 != 0 {
-                    // Counted, but not dropped. An earlier version skipped these
-                    // on the reading that a discard packet holds no picture. That
-                    // is wrong at pipeline depth above one: the first packet of
-                    // the file -- the IDR the whole first GOP references -- comes
-                    // back flagged discard, and skipping it left a stream whose
-                    // first decodable frame was the second IDR at pts 12000,
-                    // thirty frames into a sixty frame file. ffmpeg emits the
-                    // flag to keep the timeline's shape, and the container is
-                    // where the shape belongs.
+                    // Counted, and the flag is cleared before muxing.
+                    //
+                    // An earlier version skipped these, on the reading that a
+                    // discard packet holds no picture. That is wrong: at depth
+                    // above one the first packet of the file -- the IDR the whole
+                    // first GOP references -- comes back flagged, and skipping it
+                    // left a stream whose first decodable frame was thirty frames
+                    // in. Then it muxed them with the flag still set, which is
+                    // not the same thing: the mp4 muxer honours the flag and
+                    // drops the packet, so an export could be told it had written
+                    // packets the container never received. Clearing it is what
+                    // makes "mux every packet" true.
                     self.discarded += 1;
+                    (*self.packet).flags &= !(AV_PKT_FLAG_DISCARD as i32);
                 }
                 (*self.packet).stream_index = self.stream_index;
                 av_packet_rescale_ts(
@@ -468,6 +508,16 @@ impl VaapiEncoder {
     /// Frames handed to the encoder so far.
     pub fn frames_written(&self) -> u64 {
         self.frames_written
+    }
+
+    /// Waits that gave up because the driver produced no packet.
+    pub fn starved(&self) -> u64 {
+        self.starved
+    }
+
+    /// Packets written to the container.
+    pub fn muxed(&self) -> u64 {
+        self.muxed
     }
 
     /// Pictures the driver declined to encode, reported as filler packets.
