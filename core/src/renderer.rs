@@ -102,6 +102,8 @@ pub struct PreviewRenderer {
     /// because a chase filled it with a burst of frames.
     pub map_seek_time: Duration,
     pub map_seek_count: u64,
+    /// Surface sync failures seen, which are the driver's and are recovered from.
+    pub map_failures: u64,
     pub map_warm_time: Duration,
     pub map_warm_count: u64,
     pub import_time: Duration,
@@ -256,6 +258,7 @@ impl PreviewRenderer {
             map_time: Duration::ZERO,
             map_seek_time: Duration::ZERO,
             map_seek_count: 0,
+            map_failures: 0,
             map_warm_time: Duration::ZERO,
             map_warm_count: 0,
             import_time: Duration::ZERO,
@@ -512,14 +515,36 @@ impl PreviewRenderer {
             let t_import = Instant::now();
             (*self.ff.drm_frame).format = AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
             let t_map = Instant::now();
-            ffmpeg::check(
-                av_hwframe_map(
-                    self.ff.drm_frame,
-                    self.ff.decoded,
-                    AV_HWFRAME_MAP_READ as i32,
-                ),
-                "av_hwframe_map",
-            )?;
+            // A map failure is recoverable and must not end the loop.
+            //
+            // This is `vaSyncSurface` underneath: the call that waits for the
+            // video engine to finish the frame. Scrubbing hard enough produces
+            // "Failed to sync surface 0x2: 1 (operation failed)" from iHD and a
+            // map that returns EIO, and this used to propagate out of
+            // `render_frame`, which the render loop treats as fatal -- so one
+            // transient driver hiccup during a drag stopped the picture for good
+            // while the frontend carried on taking pointer events.
+            //
+            // Skipping the frame is what the other import failures already do.
+            // The cache goes with it: whatever is cached for the surfaces in
+            // flight is now suspect, and dropping it costs a re-import.
+            let map_rc = av_hwframe_map(
+                self.ff.drm_frame,
+                self.ff.decoded,
+                AV_HWFRAME_MAP_READ as i32,
+            );
+            if map_rc < 0 {
+                av_frame_unref(self.ff.decoded);
+                self.texture_cache.clear();
+                self.map_failures += 1;
+                if self.map_failures <= 3 {
+                    eprintln!(
+                        "av_hwframe_map failed ({map_rc}); skipping the frame and clearing \
+                         the import cache. This is a VA-API surface sync failure, not a seek."
+                    );
+                }
+                return Ok(FrameOutcome::Skipped);
+            }
             // Timed separately: this is the call that has to sync the video
             // engine, and it is the entire cost of the import phase.
             let map_elapsed = t_map.elapsed();

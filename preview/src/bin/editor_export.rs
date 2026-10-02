@@ -8,6 +8,7 @@
 //!
 //! usage: editor_export <clip> <output>          export the whole clip
 //!        editor_export <clip> play <frames>      present frames, no export
+//!        editor_export <clip> scrub <seconds>    drag the playhead about, no export
 //!
 //! `hwa-preview`'s own `export` mode is left alone: it drives the subprocess
 //! path and stays the reference the in-process path is compared against.
@@ -29,6 +30,9 @@ struct Runner {
     /// what it measures is the preview's own compute rather than the wait for a
     /// compositor that has nothing to show.
     play_frames: Option<u64>,
+    /// Seconds of hard scrubbing, for reproducing what a drag can do to the
+    /// decoder and the driver.
+    scrub_seconds: Option<f64>,
 }
 
 impl Runner {
@@ -137,6 +141,48 @@ impl Runner {
             }
         }
         let mut renderer = PreviewRenderer::new(host, &self.clip, format, state.clone())?;
+
+        if let Some(seconds) = self.scrub_seconds {
+            state.lock().unwrap().playing = false;
+            let duration = {
+                let s = state.lock().unwrap();
+                s.duration_ms.max(1)
+            };
+            let deadline = Instant::now() + std::time::Duration::from_secs_f64(seconds);
+            let (mut shown, mut skipped, mut errors) = (0u64, 0u64, 0u64);
+            let mut seed = 0x2545_F491_4F6C_DD1Du64;
+            let mut next_seek = Instant::now();
+            while Instant::now() < deadline {
+                if Instant::now() >= next_seek {
+                    // A drag, roughly: a new target every 30 ms, anywhere.
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let target = ((seed >> 33) % duration as u64) as i64;
+                    let mut s = state.lock().unwrap();
+                    s.position_ms = target;
+                    s.pending_seek_ms = s.source_for_timeline(target).map(|(_, src)| src);
+                    next_seek = Instant::now() + std::time::Duration::from_millis(30);
+                }
+                match renderer.render_frame(&surface, &config) {
+                    Ok(hwa_core::renderer::FrameOutcome::Skipped) => skipped += 1,
+                    // Anything that is not a skip or a pause put a frame through
+                    // the pipeline. Counting every Ok as "presented" counted the
+                    // pauses between seeks, which is most of a scrub.
+                    Ok(hwa_core::renderer::FrameOutcome::Paused) => {}
+                    Ok(_) => shown += 1,
+                    Err(e) => {
+                        errors += 1;
+                        if errors <= 3 {
+                            eprintln!("scrub error: {e:?}");
+                        }
+                    }
+                }
+            }
+            println!(
+                "scrub: {shown} presented, {skipped} skipped, {errors} errors, {} map failures",
+                renderer.map_failures
+            );
+            return Ok(());
+        }
 
         if let Some(frames) = self.play_frames {
             state.lock().unwrap().playing = true;
@@ -300,12 +346,18 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let scrub_seconds = if output == "scrub" {
+        Some(args.next().unwrap_or_else(|| "20".to_string()).parse()?)
+    } else {
+        None
+    };
     let event_loop = EventLoop::new().map_err(|e| anyhow!("EventLoop: {e}"))?;
     event_loop
         .run_app(&mut Runner {
             clip,
             output,
             play_frames,
+            scrub_seconds,
         })
         .map_err(|e| anyhow!("run_app: {e}"))
 }

@@ -371,6 +371,7 @@ fn spawn_video(
         let mut t_total = Duration::ZERO;
         let mut t_render = Duration::ZERO;
         let mut last_emit = Instant::now();
+    let mut render_failures = 0u32;
         let mut last_emit_key = (true, 0i64, 0i64);
         let mut last_size = (config.width, config.height);
         let mut last_size_poll = Instant::now();
@@ -556,10 +557,28 @@ fn spawn_video(
                 let t = Instant::now();
                 match renderer.render_frame(&surface, &config) {
                     Ok(hwa_core::renderer::FrameOutcome::Paused) => {}
-                    Ok(_) => active_frames += 1,
+                    Ok(_) => {
+                        active_frames += 1;
+                        render_failures = 0;
+                    }
                     Err(e) => {
-                        eprintln!("render_frame error: {e:?}");
-                        break;
+                        // A frame that fails is not a render loop that ends. The
+                        // decoder and the driver both have recoverable states --
+                        // a VA-API surface that will not sync, a seek that lands
+                        // somewhere odd -- and breaking here turned one of those
+                        // into a dead picture while the window carried on
+                        // accepting pointer events. Give up only if it keeps
+                        // failing, which means something is actually wrong.
+                        render_failures += 1;
+                        if render_failures <= 3 {
+                            eprintln!("render_frame error ({render_failures}): {e:?}");
+                        }
+                        if render_failures > 120 {
+                            eprintln!(
+                                "render_frame has failed {render_failures} times in a row; stopping the render loop"
+                            );
+                            break;
+                        }
                     }
                 }
                 t_render += t.elapsed();
