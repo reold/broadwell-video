@@ -125,8 +125,11 @@ pub struct PreviewRenderer {
     /// Imported encoder surface planes, one pair per pooled surface, kept for
     /// the life of an export.
     ///
-    /// See `cached_encoder_plane` for why they are not per frame.
-    encoder_imports: HashMap<(RawFd, u64), wgpu::Texture>,
+    /// Keyed by VA-API surface id, not by file descriptor: the descriptors
+    /// belong to the mapped frame and are closed every frame, so their numbers
+    /// are recycled and keying on them served one surface's texture for
+    /// another. See `cached_encoder_plane`.
+    encoder_imports: HashMap<(usize, u64), wgpu::Texture>,
     /// Holds the packed grade on its way to the encoder's surface. A buffer
     /// rather than a readback: the copy from here into the surface's planes is
     /// done on the GPU, because HasVK has no R8/Rg8 storage textures to write
@@ -740,6 +743,7 @@ impl PreviewRenderer {
             None => return Ok(()),
         };
         let y_plane = self.cached_encoder_plane(
+            surface.id,
             surface.y_fd,
             &surface.y,
             surface.modifier,
@@ -747,6 +751,7 @@ impl PreviewRenderer {
             wgpu::TextureFormat::R8Unorm,
         )?;
         let uv_plane = self.cached_encoder_plane(
+            surface.id,
             surface.uv_fd,
             &surface.uv,
             surface.modifier,
@@ -924,13 +929,19 @@ impl PreviewRenderer {
     /// open. The pool is bounded, so they live as long as the export does.
     fn cached_encoder_plane(
         &mut self,
+        surface_id: usize,
         fd: RawFd,
         plane: &crate::encoder::Plane,
         modifier: u64,
         size: dpi::PhysicalSize<u32>,
         format: wgpu::TextureFormat,
     ) -> Result<wgpu::Texture> {
-        let key = (fd, plane.offset);
+        // The surface id, never the fd. File descriptors here come from the
+        // mapped frame and are closed when it is unref'd, so the same number
+        // comes back for a different surface: keyed that way, two thirds of a
+        // 900 frame export wrote one surface and handed another to the encoder,
+        // which read a surface nothing had written and encoded zeros.
+        let key = (surface_id, plane.offset);
         if let Some(texture) = self.encoder_imports.get(&key) {
             return Ok(texture.clone());
         }

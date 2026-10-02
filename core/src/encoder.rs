@@ -37,6 +37,11 @@ pub struct Plane {
 /// `dup` first.
 #[derive(Clone, Copy, Debug)]
 pub struct Surface {
+    /// The VA-API surface this came from. Stable for the life of the surface,
+    /// which the file descriptors are not: they belong to the mapped frame and
+    /// are closed every time it is unref'd, so the kernel recycles the numbers.
+    /// Anything caching per surface must key on this.
+    pub id: usize,
     pub y_fd: RawFd,
     pub uv_fd: RawFd,
     pub modifier: u64,
@@ -326,6 +331,7 @@ impl VaapiEncoder {
             let uv_object = &(*desc).objects[uv_plane.object_index as usize];
 
             Ok(Surface {
+                id: (*self.frame).data[3] as usize,
                 y_fd: y_object.fd,
                 uv_fd: uv_object.fd,
                 modifier: y_object.format_modifier,

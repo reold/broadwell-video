@@ -163,7 +163,12 @@ fn in_process_export_throughput() {
     // wrapping a dma-buf while the encoder still reads that surface loses
     // pictures. Decoder surfaces are left per frame, which is what the renderer's
     // bounded frame cache does in effect.
-    let mut encoder_imports: HashMap<(std::os::fd::RawFd, u64), wgpu::Texture> = HashMap::new();
+    // Keyed by VA-API surface id, not file descriptor. The descriptors belong to
+    // the mapped frame and are closed each frame, so their numbers recycle and
+    // an fd-keyed cache serves one surface's texture for another: this harness
+    // reproduced exactly that, 600 of 900 frames encoded from a surface nothing
+    // had written.
+    let mut encoder_imports: HashMap<(usize, u64), wgpu::Texture> = HashMap::new();
 
     let mut frames = 0u64;
     let (mut t_import, mut t_grade, mut t_handoff, mut t_send) = (
@@ -234,8 +239,8 @@ fn in_process_export_throughput() {
                               info: hwa_core::encoder::Plane,
                               size: dpi::PhysicalSize<u32>,
                               format: wgpu::TextureFormat,
-                              map: &mut HashMap<(std::os::fd::RawFd, u64), wgpu::Texture>| {
-            map.entry((fd, info.offset))
+                              map: &mut HashMap<(usize, u64), wgpu::Texture>| {
+            map.entry((surface.id, info.offset))
                 .or_insert_with(|| {
                     import_plane(
                         &host,
@@ -450,6 +455,50 @@ fn in_process_export_throughput() {
         .parse()
         .expect("frame count");
     println!("encoder wrote {written} frames; the file holds {count}");
+
+    // Content, not just count. A surface the GPU never wrote encodes as all
+    // zeros: chroma of 0 rather than the 128 of a black frame, which decodes as
+    // a green flash. Counting frames cannot see that -- a whole export was
+    // pixel-wrong while every count was right -- so this asks signalstats for
+    // per frame chroma and insists none of it is empty.
+    let stats = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-i",
+            out,
+            "-vf",
+            "signalstats,metadata=print:file=-",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .expect("ffmpeg signalstats");
+    let text = String::from_utf8_lossy(&stats.stdout);
+    let mut pending: Option<f64> = None;
+    let (mut checked, mut blank) = (0u64, 0u64);
+    let mut close = |u: Option<f64>, checked: &mut u64, blank: &mut u64| {
+        if let Some(u) = u {
+            *checked += 1;
+            if u < 20.0 {
+                *blank += 1;
+            }
+        }
+    };
+    for line in text.lines() {
+        if line.starts_with("frame:") {
+            close(pending.take(), &mut checked, &mut blank);
+            continue;
+        }
+        if let Some(rest) = line.split("UAVG=").nth(1) {
+            pending = rest.trim().parse().ok();
+        }
+    }
+    close(pending, &mut checked, &mut blank);
+    println!("content: {checked} frames measured, {blank} with no chroma");
+    assert_eq!(checked, count, "signalstats saw a different number of frames");
+    assert_eq!(blank, 0, "{blank} frames carry an empty chroma plane");
 
     unsafe {
         av_log_set_level(AV_LOG_QUIET);
