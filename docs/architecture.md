@@ -185,3 +185,73 @@ preview, `grade_y.wgsl` and `grade_uv.wgsl` for the export — kept in step. It
 will, however, be the first feature that *wants* the document and the undo
 spine, and the first that would benefit from the frame cache being keyed on
 time rather than identity.
+
+---
+
+## Addendum: the crate survey, and what to do next
+
+A survey of the Rust ecosystem was done against the real constraint, which is
+**wgpu 30.0.1**: wgpu types are not interchangeable across majors, so anything
+pinned to wgpu 29 cannot share a device with this project. That single filter
+decides most of the field. Findings, with the verdicts that matter:
+
+**Shapes — adopt nothing.** Rects, rounded rects, ellipses and convex polygons
+are analytic signed-distance fields evaluated in the compute pass this project
+already dispatches, with anti-aliasing derived from the SDF gradient (`fwidth`)
+rather than a fixed threshold. This is what Zed's GPUI does for its entire
+editor chrome, and it is what Fret's ADR 0030 codifies. Shapes written this way
+inherit the grade, produce the same packed NV12, and cost no extra pass.
+`lyon_tessellation` 1.0.22 is the right tool only when strokes with joins,
+concave polygons, holes or Béziers arrive — it is pure CPU tessellation with no
+GPU coupling, so it fits wgpu 30 by construction.
+
+**Text — `glyphon` 0.12.0.** The only crate that is simultaneously maintained,
+wgpu-30-native, and able to shape complex scripts (it is cosmic-text plus
+harfrust, and ships an Arabic sample). Two constraints found by reading its
+source, not its README: its glyph atlas is `pub(crate)` and cannot be bound to
+another pipeline, and its pipeline is built for exactly one colour-target
+format. So the path is: render glyphon into an offscreen `Rgba8UnormSrgb`
+texture inside a render pass we own, then sample that texture from the compute
+pass. Roughly sixty lines. The upgrade path, if that format constraint bites, is
+`cosmic-text` + `swash` + `etagere` and our own atlas — `SwashCache::get_image`
+hands back `SwashContent::{Mask, SubpixelMask, Color}` and is exactly how
+glyphon is built.
+
+**Timeline — keep ours.** There is no maintained, published Rust
+OpenTimelineIO. The crates.io entries are 2020 placeholders; the real
+implementation (alchemist-editor/otio-rust, Apache-2.0) is five weeks old and
+unpublished, so adopting it means a git dependency. `avio` 0.18.4 is the closest
+architectural match but owns decode and encode, which would replace the VA-API +
+dma-buf path. **`mediatime` 0.4.0 is the one adoption worth making:** `no_std`,
+zero dependencies, `AVRational`-exact, with `Timebase`, `Timestamp`, `TimeRange`
+and `Rate` as distinct types. It deletes the `f64`-seconds bug class this
+project has now hit twice.
+
+**Compositor — write it.** No crate composites a layer stack in wgpu. Every
+project surveyed wrote its own: one dispatch per layer into a float accumulation
+target, premultiplied alpha, ping-pong for blend modes. Roughly 300–600 lines,
+and the absence is not a gap to wait on. `vello` is the trap — the published
+crate pins wgpu 29 and the crate named `vello` is now an experimental renderer
+under `research/`; `vello_gpu` on crates.io is a name reservation, not code.
+
+**Prior art worth reading, not copying:** OpenTake (GPL-3.0, but the closest
+twin — Rust core, Tauri 2, FFmpeg, wgpu, command-based undo, a Text panel) and
+tooscut (714 stars, Rust compositor with keyframe animation).
+
+### The next move, exactly
+
+1. **Tracks.** `Project { tracks: Vec<Track> }` with `Track { clips }`, clips
+   drawn bottom-up, and the transform already being the per-layer property. This
+   is what "drag it to the upper layer" and "whatever layer is underneath"
+   require, and the clip walk in `renderer.rs` is the thing that has to learn
+   about it: today it walks one flat list by index.
+2. **Shapes**, as an SDF `kind` on a generator layer, riding the same dispatch.
+3. **Text**, per the glyphon note above.
+4. **On-canvas handles**, which need the letterbox geometry in the snapshot so
+   the frontend can map a pointer position into frame coordinates. That mapping
+   is the whole reason the handles are not a pure-UI change.
+
+Guard rail for all four: `editor_export` in `preview/src/bin/` is the only thing
+that has caught the last four export bugs, because it can measure. Every feature
+above needs a way to be measured there — frame counts, mean luma, or a new
+probe — and not merely looked at.
