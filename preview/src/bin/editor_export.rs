@@ -143,6 +143,29 @@ impl Runner {
                 );
             }
         }
+        // Optional: exercise an edit and its undo, which is the path a delete
+        // and Ctrl+Z take. HWA_TEST_UNDO=delete:1
+        if let Ok(spec) = std::env::var("HWA_TEST_UNDO") {
+            let (op, arg) = spec.split_once(':').unwrap_or((spec.as_str(), "0"));
+            let index = arg.trim().parse::<usize>().unwrap_or(0);
+            let mut s = state.lock().unwrap();
+            if op.trim() == "delete" && index < s.clips.len() {
+                let before = s.clips[index].clone();
+                s.push_edit(hwa_core::state::Edit::DeleteClip { index, before });
+                println!(
+                    "undo test: deleted clip {index}, timeline {:.2}s in {} clips",
+                    s.duration_ms as f64 / 1000.0,
+                    s.clips.len()
+                );
+                s.undo();
+                println!(
+                    "undo test: undone, timeline {:.2}s in {} clips",
+                    s.duration_ms as f64 / 1000.0,
+                    s.clips.len()
+                );
+            }
+        }
+
         let mut renderer = PreviewRenderer::new(host, &self.clip, format, state.clone())?;
 
         if let Some(steps) = self.grade_steps {
@@ -394,7 +417,13 @@ impl Runner {
             (s.duration_ms, s.fps)
         };
         let expected = (duration_ms as f64 * fps_now / 1000.0).round() as u64;
-        if expected > 0 && written.abs_diff(expected) > 2 {
+        // One frame per clip boundary lands on both sides of the cut, so the
+        // tolerance is a frame per clip rather than a fixed two.
+        let tolerance = 2 + {
+            let s = state.lock().unwrap();
+            s.clips.len() as u64
+        };
+        if expected > 0 && written.abs_diff(expected) > tolerance {
             eprintln!(
                 "WARNING: the timeline asked for about {expected} frames and the export wrote {written}"
             );

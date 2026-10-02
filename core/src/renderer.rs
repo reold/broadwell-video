@@ -536,29 +536,42 @@ impl PreviewRenderer {
                 // for 301, and the short file verified clean, because the check
                 // only asks whether what was written is readable.
                 if self.prune_to_ms.is_none() {
-                    let jump = {
+                    // Some((where to seek, whether that means the next clip)).
+                    // The two cases are distinct and must not be guessed at from
+                    // the times involved: running past a clip's out point moves
+                    // on, landing before its in point does not.
+                    let jump: Option<Option<(i64, bool)>> = {
                         let s = self.state.lock().unwrap();
                         match s.clips.get(self.clip_index) {
                             None => Some(None),
                             Some(clip) if pts >= clip.out_ms => {
                                 match s.clips.get(self.clip_index + 1) {
-                                    Some(next) => Some(Some(next.in_ms)),
+                                    Some(next) => Some(Some((next.in_ms, true))),
                                     None => Some(None),
                                 }
                             }
                             // Before this clip's in point, which a seek to an
-                            // earlier keyframe can land on. Nothing to show.
-                            Some(clip) if pts < clip.in_ms => Some(Some(clip.in_ms)),
+                            // earlier keyframe can land on.
+                            Some(clip) if pts < clip.in_ms => Some(Some((clip.in_ms, false))),
                             Some(_) => None,
                         }
                     };
                     match jump {
-                        Some(Some(in_ms)) => {
+                        Some(Some((in_ms, advance))) => {
                             av_frame_unref(self.ff.decoded);
-                            if pts >= in_ms {
+                            if advance {
                                 self.clip_index += 1;
                             }
-                            self.state.lock().unwrap().pending_seek_ms = Some(in_ms);
+                            // Seek here rather than queueing one. The queue is
+                            // the UI's channel, and its handler re-derives which
+                            // clip to walk from the source position -- which is
+                            // ambiguous the moment two clips cover the same part
+                            // of the file. The walk then reset itself to an
+                            // earlier clip and replayed it forever: an export of
+                            // overlapping clips never finished at all.
+                            unsafe { self.ff.seek_to_ms(in_ms)? };
+                            self.prune_to_ms = Some(in_ms);
+                            self.seeks += 1;
                             continue;
                         }
                         Some(None) => {
