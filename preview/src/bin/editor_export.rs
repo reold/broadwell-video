@@ -6,7 +6,8 @@
 //! The only thing missing is the webview, so a failed export can be reproduced
 //! and iterated on without a human running the app and pasting logs.
 //!
-//! usage: editor-export <clip> <output>
+//! usage: editor_export <clip> <output>          export the whole clip
+//!        editor_export <clip> play <frames>      present frames, no export
 //!
 //! `hwa-preview`'s own `export` mode is left alone: it drives the subprocess
 //! path and stays the reference the in-process path is compared against.
@@ -24,6 +25,10 @@ use winit::window::{Window, WindowId};
 struct Runner {
     clip: String,
     output: String,
+    /// Present instead of exporting, for this many frames. A hidden window, so
+    /// what it measures is the preview's own compute rather than the wait for a
+    /// compositor that has nothing to show.
+    play_frames: Option<u64>,
 }
 
 impl Runner {
@@ -87,7 +92,32 @@ impl Runner {
 
         let state = state::new_shared();
         state.lock().unwrap().video_path = self.clip.clone();
-        let mut renderer = PreviewRenderer::new(host, &self.clip, format, state)?;
+        let mut renderer = PreviewRenderer::new(host, &self.clip, format, state.clone())?;
+
+        if let Some(frames) = self.play_frames {
+            state.lock().unwrap().playing = true;
+            let start = Instant::now();
+            let mut rendered = 0u64;
+            for _ in 0..frames {
+                renderer.render_frame(&surface, &config)?;
+                rendered += 1;
+            }
+            let wall = start.elapsed();
+            let per = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / rendered.max(1) as f64;
+            println!(
+                "play: {rendered} frames in {:.1}s = {:.1} fps",
+                wall.as_secs_f64(),
+                rendered as f64 / wall.as_secs_f64(),
+            );
+            println!(
+                "  chase {:.2} ms  map {:.2} ms  import {:.2} ms  present {:.2} ms",
+                per(renderer.chase_time),
+                per(renderer.map_time),
+                per(renderer.import_time),
+                per(renderer.present_time),
+            );
+            return Ok(());
+        }
 
         // ---- exactly what the editor's loop does ----
         renderer.begin_export(&self.output)?;
@@ -165,9 +195,18 @@ impl ApplicationHandler for Runner {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let clip = args.next().ok_or_else(|| anyhow!("usage: editor-export <clip> <output>"))?;
-    let output = args.next().ok_or_else(|| anyhow!("usage: editor-export <clip> <output>"))?;
+    let output = args.next().ok_or_else(|| anyhow!("usage: editor_export <clip> <output|play> [frames]"))?;
+    let play_frames = if output == "play" {
+        Some(args.next().unwrap_or_else(|| "300".to_string()).parse()?)
+    } else {
+        None
+    };
     let event_loop = EventLoop::new().map_err(|e| anyhow!("EventLoop: {e}"))?;
     event_loop
-        .run_app(&mut Runner { clip, output })
+        .run_app(&mut Runner {
+            clip,
+            output,
+            play_frames,
+        })
         .map_err(|e| anyhow!("run_app: {e}"))
 }

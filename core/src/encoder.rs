@@ -83,23 +83,11 @@ pub struct VaapiEncoder {
     /// frame at a time, at 30.7 ms of send per frame. Holding a reference keeps
     /// each surface out of the pool until the queue has moved past it.
     handoff: VecDeque<*mut AVFrame>,
-    /// When the previous frame was sent, for pacing.
-    last_send: Option<std::time::Instant>,
     finished: bool,
 }
 
 /// How many sent frames to keep alive. Comfortably more than `async_depth`.
 const HANDOFF_HOLD: usize = 2;
-
-/// The shortest interval between frames handed to the encoder.
-///
-/// The driver discards pictures when it is fed faster than it can encode, and
-/// the numbers say where that starts. Unpaced, the editor's flow runs at 124 fps
-/// and the file comes back with 881 packets for 900 frames; the throughput
-/// harness at 91 fps loses none. Pacing is cheaper than dropping: a cap of about
-/// seventy frames a second costs a little speed and keeps every picture, while
-/// the file that arrives short costs the whole export.
-const MIN_FRAME_PERIOD: std::time::Duration = std::time::Duration::from_micros(14_000);
 
 /// How long to wait for a packet before giving up and carrying on.
 ///
@@ -304,7 +292,6 @@ impl VaapiEncoder {
                 discarded: 0,
                 starved: 0,
                 handoff: VecDeque::new(),
-                last_send: None,
                 frames_written: 0,
                 finished: false,
             })
@@ -374,14 +361,14 @@ impl VaapiEncoder {
 
     /// Send the surface filled by the GPU and mux whatever the encoder emits.
     pub fn write_frame(&mut self) -> Result<()> {
-        // Pace to the fastest rate the driver has been measured to sustain.
-        if let Some(last) = self.last_send {
-            let elapsed = last.elapsed();
-            if elapsed < MIN_FRAME_PERIOD {
-                std::thread::sleep(MIN_FRAME_PERIOD - elapsed);
-            }
-        }
-        self.last_send = Some(std::time::Instant::now());
+        // No pacing here. There used to be: a fourteen millisecond floor per
+        // frame, because the encoder was discarding pictures when fed faster.
+        // That was i965, which /etc/environment was pinning; on iHD the editor's
+        // own flow runs 900 frames in 6.9 to 7.1 seconds -- 127 to 130 fps --
+        // with 900 of 900 decodable and a clean exit, three runs out of three.
+        // The cap was costing half the throughput. Back-pressure still comes from
+        // the in-flight window below, which is what actually keeps the driver
+        // from being flooded.
         unsafe {
             (*self.frame).pts = self.frames_written as i64;
             // Duration in the encoder's time base, so the muxer knows how long
