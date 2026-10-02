@@ -518,10 +518,14 @@
     loadLayout();
     reportLayout();
     measurePane();
+    // Held rather than returned here. A `return` in the middle of onMount skips
+    // everything after it, and everything after this is the initial state, the
+    // export path and the update listeners -- which is how the timeline came up
+    // with no clips and the output file name blank: neither was ever asked for.
+    let observer: ResizeObserver | null = null;
     if (paneEl) {
-      const observer = new ResizeObserver(measurePane);
+      observer = new ResizeObserver(measurePane);
       observer.observe(paneEl);
-      return () => observer.disconnect();
     }
 
     invoke<StateSnapshot>("get_state").then((s) => {
@@ -618,6 +622,7 @@
     window.addEventListener("keydown", onKey);
 
     return () => {
+      observer?.disconnect();
       unlisten.then((f) => f());
       unlistenExport.then((f) => f());
       window.removeEventListener("keydown", onKey);
