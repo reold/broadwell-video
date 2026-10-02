@@ -58,6 +58,8 @@ pub struct VaapiEncoder {
     stream: *mut AVStream,
     stream_index: i32,
     frames_written: u64,
+    /// Packets actually written to the container.
+    muxed: u64,
     discarded: u64,
     /// Frames sent to the encoder that it may still be holding.
     ///
@@ -74,6 +76,15 @@ pub struct VaapiEncoder {
 
 /// How many sent frames to keep alive. Comfortably more than `async_depth`.
 const HANDOFF_HOLD: usize = 8;
+
+/// How many pictures may be in the encoder at once before the caller waits.
+///
+/// The child process this replaced was paced by its pipe: a write blocked when
+/// ffmpeg's input buffer filled. In process there is nothing to block on, and
+/// `avcodec_send_frame` keeps accepting long after the encoder has stopped
+/// keeping up, so the driver drops pictures. Measured in the editor with no
+/// limit at all: 900 frames written and 860 in the file, at 128 frames a second.
+const IN_FLIGHT_WINDOW: u64 = 4;
 
 fn describe(rc: i32) -> String {
     let mut buffer = [0i8; 256];
@@ -246,6 +257,7 @@ impl VaapiEncoder {
                 mux,
                 stream,
                 stream_index: (*stream).index,
+                muxed: 0,
                 discarded: 0,
                 handoff: VecDeque::new(),
                 frames_written: 0,
@@ -344,19 +356,39 @@ impl VaapiEncoder {
             // Counted before draining so the mux cap in `drain` knows how many
             // pictures belong to real frames.
             self.frames_written += 1;
-            self.drain()?;
+            self.drain(false)?;
+            // Back-pressure: wait for the encoder rather than queueing pictures
+            // it will have to drop. See IN_FLIGHT_WINDOW.
+            while self.frames_written.saturating_sub(self.muxed) > IN_FLIGHT_WINDOW {
+                if self.drain(true)? {
+                    break;
+                }
+            }
             Ok(())
         }
     }
 
-    fn drain(&mut self) -> Result<()> {
+    /// Pull whatever the encoder has ready, muxing it.
+    ///
+    /// Returns true once the stream is finished. With `wait_for_one` it does not
+    /// return until at least one packet has been muxed, which is how the caller
+    /// applies back-pressure: there is nothing else to block on.
+    fn drain(&mut self, wait_for_one: bool) -> Result<bool> {
         unsafe {
+            let mut muxed_any = false;
             loop {
                 let rc = avcodec_receive_packet(self.codec, self.packet);
                 if rc == AVERROR_EOF {
-                    break;
+                    return Ok(true);
                 }
                 if rc == AVERROR(libc::EAGAIN) {
+                    if wait_for_one && !muxed_any {
+                        // The encoder is still working. Nothing outside the
+                        // driver can see its completion, so this is a short
+                        // sleep rather than a fence.
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                        continue;
+                    }
                     // The encoder wants more input before it can emit.
                     break;
                 }
@@ -386,8 +418,13 @@ impl VaapiEncoder {
                     "mux an encoded packet",
                 )?;
                 av_packet_unref(self.packet);
+                self.muxed += 1;
+                muxed_any = true;
+                if wait_for_one {
+                    break;
+                }
             }
-            Ok(())
+            Ok(false)
         }
     }
 
@@ -412,7 +449,7 @@ impl VaapiEncoder {
                 )?;
             }
             check(avcodec_send_frame(self.codec, null_mut()), "flush the encoder")?;
-            self.drain()?;
+            while !self.drain(true)? {}
             check(av_write_trailer(self.mux), "write the trailer")?;
             if !(*self.mux).pb.is_null() {
                 avio_closep(&mut (*self.mux).pb);

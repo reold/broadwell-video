@@ -358,10 +358,7 @@ fn spawn_video(
                                             Some(in_file) => {
                                                 let missing = frames.saturating_sub(in_file);
                                                 println!(
-                                                    "[{stamp}] WARNING: wrote {frames} frames but the file holds \\
-                                                     {in_file}; {missing} were lost, and every picture referencing \\
-                                                     one is undecodable too. Set HWA_EXPORT_ENCODER=x264 to use \\
-                                                     the software encoder."
+                                                    "[{stamp}] WARNING: wrote {frames} frames but the file holds {in_file}; {missing} were lost, and every picture referencing one is undecodable too."
                                                 );
                                                 report_export(
                                                     &renderer.state,
