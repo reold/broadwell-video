@@ -186,9 +186,18 @@ impl PreviewRenderer {
 
         {
             let mut s = state.lock().unwrap();
-            s.duration_ms = ff.duration_ms;
+            // The file's length is not the timeline's. This assignment used to
+            // put the file's length into `duration_ms`, which is only the same
+            // number before anything has been cut, and quietly became the wrong
+            // denominator for the progress bar and the export's frame estimate.
+            s.source_duration_ms = ff.duration_ms;
             s.fps = ff.fps;
             s.video_path = video_path.to_string();
+            if s.clips.is_empty() {
+                s.reset_timeline(ff.duration_ms);
+            } else {
+                s.refresh_duration();
+            }
         }
 
         let pipelines = gpu::build_pipelines(&host, surface_format, vw, vh);
