@@ -7,6 +7,39 @@ pub mod gpu;
 pub mod renderer;
 pub mod state;
 
+/// Point libva at the maintained driver before any VA-API device is opened.
+///
+/// This machine's `/etc/environment` pins `LIBVA_DRIVER_NAME=i965`, so every
+/// process inherits the archived driver whether it asked for it or not. i965
+/// drops frames on this hardware -- 840 decodable of 898 with synthetic black
+/// input and nothing else running -- and once aborted ffmpeg on an assertion in
+/// `i965_MapBuffer2`. The subprocess export escaped that by overriding the
+/// variable for its child, which is why it measured 899 of 899 while the
+/// in-process encoder, inheriting the ambient setting, kept losing a few frames
+/// per thousand. This does for the whole process what that override did for the
+/// child, decode included: the decode path was measured working, and faster,
+/// under iHD.
+///
+/// `HWA_VAAPI_DRIVER` chooses instead; set it to `inherit` to leave the
+/// environment alone.
+pub fn select_vaapi_driver() {
+    let wanted = std::env::var("HWA_VAAPI_DRIVER").unwrap_or_else(|_| "iHD".to_string());
+    if wanted == "inherit" {
+        return;
+    }
+    let current = std::env::var("LIBVA_DRIVER_NAME").ok();
+    if current.as_deref() == Some(wanted.as_str()) {
+        return;
+    }
+    // SAFETY: called from the thread that constructs the renderer, before any
+    // VA-API device exists in this process, so no libva call can race it.
+    unsafe { std::env::set_var("LIBVA_DRIVER_NAME", &wanted) };
+    println!(
+        "VA-API driver: {wanted} (overriding {})",
+        current.unwrap_or_else(|| "the libva default".to_string())
+    );
+}
+
 /// Local wall-clock time as `HH:MM:SS`, for log lines.
 ///
 /// Goes through libc rather than pulling in a date/time crate: it is already a

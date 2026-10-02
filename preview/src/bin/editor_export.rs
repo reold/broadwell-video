@@ -137,12 +137,14 @@ impl Runner {
             per(renderer.export_handoff_time),
             per(renderer.export_write_time),
         );
+        // eprintln, not println: iHD aborts somewhere in teardown on this
+        // machine and buffered stdout is lost when it does.
         match in_file {
             Some(n) if n >= written => {
-                println!("  verified: wrote {written}, the file holds {n}")
+                eprintln!("  verified: wrote {written}, the file holds {n}")
             }
-            Some(n) => println!("  FAILED: wrote {written}, the file holds {n} ({} lost)", written - n),
-            None => println!("  wrote {written}; ffprobe could not read the file"),
+            Some(n) => eprintln!("  FAILED: wrote {written}, the file holds {n} ({} lost)", written - n),
+            None => eprintln!("  wrote {written}; ffprobe could not read the file"),
         }
         Ok(())
     }

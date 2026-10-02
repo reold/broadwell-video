@@ -146,6 +146,8 @@ impl PreviewRenderer {
         surface_format: wgpu::TextureFormat,
         state: SharedState,
     ) -> Result<Self> {
+        // Before the decoder opens a VA-API device.
+        crate::select_vaapi_driver();
         let ff = unsafe { ffmpeg::Handles::open(video_path, "/dev/dri/renderD128")? };
         let vw = ff.width;
         let vh = ff.height;

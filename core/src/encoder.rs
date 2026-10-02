@@ -145,6 +145,9 @@ impl VaapiEncoder {
         qp: i32,
         async_depth: i32,
     ) -> Result<Self> {
+        // The encoder falls back to the ambient driver if its caller has not
+        // already chosen one, which on this machine means the archived i965.
+        crate::select_vaapi_driver();
         unsafe {
             let device_name = CString::new("/dev/dri/renderD128")?;
             let mut device: *mut AVBufferRef = null_mut();
