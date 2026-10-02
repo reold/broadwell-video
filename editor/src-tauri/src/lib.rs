@@ -222,6 +222,67 @@ fn cancel_export(state: State<'_, SharedState>) {
     }
 }
 
+/// Count what is actually in the exported file, and report it.
+///
+/// Runs on its own thread because counting means decoding: `ffprobe
+/// -count_frames` is the only check that catches pictures the muxer wrote and
+/// the decoder cannot reconstruct, and it costs a full pass over the file.
+fn verify_export(
+    state: SharedState,
+    window: tauri::WebviewWindow,
+    output: String,
+    frames: u64,
+    clean_exit: bool,
+    stamp: String,
+) {
+    match hwa_core::export::count_output_frames(&output) {
+        Some(in_file) if in_file >= frames => {
+            println!("[{stamp}] export verified: {in_file} frames in the file");
+            if !clean_exit {
+                println!(
+                    "[{stamp}] note: ffmpeg exited non-zero after writing a complete file \
+                     (known iHD teardown abort)"
+                );
+            }
+            report_export(&state, ExportStage::Done, None);
+        }
+        Some(in_file) => {
+            let missing = frames.saturating_sub(in_file);
+            println!(
+                "[{stamp}] WARNING: wrote {frames} frames but the file holds {in_file}; \
+                 {missing} were lost, and every picture referencing one is undecodable too."
+            );
+            report_export(
+                &state,
+                ExportStage::Failed,
+                Some(format!("{in_file} of {frames} frames survived")),
+            );
+        }
+        None => {
+            println!(
+                "[{stamp}] export not verified (ffprobe unavailable); ffmpeg exit was {}",
+                if clean_exit { "clean" } else { "abnormal" }
+            );
+            report_export(
+                &state,
+                if clean_exit {
+                    ExportStage::Done
+                } else {
+                    ExportStage::Failed
+                },
+                if clean_exit {
+                    None
+                } else {
+                    Some("ffmpeg exited abnormally and the output could not be verified".into())
+                },
+            );
+        }
+    }
+    if let Some(p) = export_progress(&state) {
+        let _ = window.emit("export_progress", &p);
+    }
+}
+
 fn report_export(state: &SharedState, stage: ExportStage, error: Option<String>) {
     if let Some(job) = state.lock().unwrap().export.as_mut() {
         job.stage = stage;
@@ -459,53 +520,30 @@ fn spawn_video(
                                         println!(
                                             "[{stamp}] export finished: {frames} frames -> {output}"
                                         );
-                                        // The file is the source of truth, not
-                                        // the exit status: iHD aborts during
-                                        // teardown after the muxer has already
-                                        // finished, so a correct file can arrive
-                                        // with a non-zero exit.
-                                        match hwa_core::export::count_output_frames(&output) {
-                                            Some(in_file) if in_file >= frames => {
-                                                println!("[{stamp}] export verified: {in_file} frames in the file");
-                                                if !clean_exit {
-                                                    println!(
-                                                        "[{stamp}] note: ffmpeg exited non-zero after writing a \\
-                                                         complete file (known iHD teardown abort)"
-                                                    );
-                                                }
-                                                report_export(&renderer.state, ExportStage::Done, None);
-                                            }
-                                            Some(in_file) => {
-                                                let missing = frames.saturating_sub(in_file);
-                                                println!(
-                                                    "[{stamp}] WARNING: wrote {frames} frames but the file holds {in_file}; {missing} were lost, and every picture referencing one is undecodable too."
-                                                );
-                                                report_export(
-                                                    &renderer.state,
-                                                    ExportStage::Failed,
-                                                    Some(format!("{in_file} of {frames} frames survived")),
-                                                );
-                                            }
-                                            None => {
-                                                println!(
-                                                    "export not verified (ffprobe unavailable); ffmpeg exit was {}",
-                                                    if clean_exit { "clean" } else { "abnormal" }
-                                                );
-                                                report_export(
-                                                    &renderer.state,
-                                                    if clean_exit {
-                                                        ExportStage::Done
-                                                    } else {
-                                                        ExportStage::Failed
-                                                    },
-                                                    if clean_exit {
-                                                        None
-                                                    } else {
-                                                        Some("ffmpeg exited abnormally and the output could not be verified".into())
-                                                    },
-                                                );
-                                            }
-                                        }
+                                        // Verification decodes the whole file, which
+                                        // on a 900 frame export is seconds. It used to
+                                        // run here, on the render thread, holding the
+                                        // state lock: the UI froze for the duration and
+                                        // an edit clicked meanwhile looked like it had
+                                        // hung. It runs on its own thread now and
+                                        // reports through the same event the progress
+                                        // bar already listens to.
+                                        let state_for_check = renderer.state.clone();
+                                        let window_for_check = window.clone();
+                                        let output_for_check = output.clone();
+                                        std::thread::spawn(move || {
+                                            verify_export(
+                                                state_for_check,
+                                                window_for_check,
+                                                output_for_check,
+                                                frames,
+                                                clean_exit,
+                                                stamp,
+                                            );
+                                        });
+                                        // The stage the UI shows until the check
+                                        // answers: written, not yet verified.
+                                        report_export(&renderer.state, ExportStage::Running, None);
                                     }
                                     Err(e) => report_export(
                                         &renderer.state,
@@ -589,9 +627,18 @@ fn spawn_video(
                 // playhead follows the pointer locally. So: only when something
                 // actually changed, no faster than 20 Hz, and never while scrubbing.
                 if last_emit.elapsed() >= Duration::from_millis(50) && !renderer.is_scrubbing() {
-                    let snap = renderer.state.lock().unwrap().snapshot();
+                    let (snap, dirty) = {
+                        let mut s = renderer.state.lock().unwrap();
+                        let dirty = s.dirty;
+                        s.dirty = false;
+                        (s.snapshot(), dirty)
+                    };
+                    // The key only covers what moves the playhead. An edit moves
+                    // neither of those, so a document change has to force the
+                    // emit or the panel sits on stale values until something
+                    // else happens to change.
                     let key = (snap.playing, snap.position_ms, snap.duration_ms);
-                    if key != last_emit_key {
+                    if key != last_emit_key || dirty {
                         let _ = window.emit("playhead_update", &snap);
                         last_emit_key = key;
                     }

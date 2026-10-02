@@ -61,6 +61,68 @@
 
   let clips = $state<Clip[]>([]);
   let selectedClip = $state(0);
+
+  // Panel sizes, remembered between runs. Blender's arrangement: every boundary
+  // is somewhere the user can put it, and it stays put.
+  let bottomHeight = $state(300);
+  let effectsWidth = $state(228);
+  let resizing = $state<"none" | "bottom" | "effects">("none");
+  let resizeStart = { x: 0, y: 0, bottom: 300, effects: 228 };
+
+  function loadLayout() {
+    try {
+      const raw = localStorage.getItem("hwa.layout");
+      if (!raw) return;
+      const saved = JSON.parse(raw) as { bottom?: number; effects?: number };
+      if (saved.bottom) bottomHeight = saved.bottom;
+      if (saved.effects) effectsWidth = saved.effects;
+    } catch {
+      // A layout that will not parse is not worth failing a startup over.
+    }
+  }
+
+  function saveLayout() {
+    try {
+      localStorage.setItem(
+        "hwa.layout",
+        JSON.stringify({ bottom: bottomHeight, effects: effectsWidth })
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function beginResize(which: "bottom" | "effects", e: PointerEvent) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    resizing = which;
+    resizeStart = {
+      x: e.clientX,
+      y: e.clientY,
+      bottom: bottomHeight,
+      effects: effectsWidth,
+    };
+    window.addEventListener("pointermove", onResizeMove);
+    window.addEventListener("pointerup", endResize, { once: true });
+  }
+
+  function onResizeMove(e: PointerEvent) {
+    if (resizing === "bottom") {
+      // The strip grows upward, so dragging up makes it taller.
+      const next = resizeStart.bottom - (e.clientY - resizeStart.y);
+      bottomHeight = Math.max(120, Math.min(window.innerHeight - 160, next));
+    } else if (resizing === "effects") {
+      const next = resizeStart.effects - (e.clientX - resizeStart.x);
+      effectsWidth = Math.max(160, Math.min(window.innerWidth - 320, next));
+    }
+  }
+
+  function endResize() {
+    if (resizing !== "none") saveLayout();
+    resizing = "none";
+    window.removeEventListener("pointermove", onResizeMove);
+  }
   let undoDepth = $state(0);
   let redoDepth = $state(0);
   let positionMs = $state(0);
@@ -117,6 +179,8 @@
   }
 
   onMount(() => {
+    loadLayout();
+
     invoke<StateSnapshot>("get_state").then((s) => {
       positionMs = s.position_ms;
       durationMs = s.duration_ms || 60_000;
@@ -312,6 +376,9 @@
 
   function beginDrag(e: PointerEvent) {
     if (e.button !== 0) return;
+    // Selecting the label's text is a drag too, and it is not a scrub.
+    const target = e.target as HTMLElement | null;
+    if (target?.closest(".clip-label")) return;
     dragging = true;
     invoke("log_msg", { msg: `beginDrag clientX=${e.clientX}` });
     seekFromPointer(e);
@@ -355,7 +422,13 @@
 <div class="timeline-root">
   <div class="preview-spacer"></div>
 
-  <div class="ui-bottom">
+  <div
+    class="splitter-h"
+    role="separator"
+    aria-label="Resize timeline"
+    onpointerdown={(e) => beginResize("bottom", e)}
+  ></div>
+  <div class="ui-bottom" style="height: {bottomHeight}px">
     <div class="toolbar">
       <div class="transport">
         <button type="button" title="Go to start (Home)" onclick={() => seekTo(0)}>
@@ -516,9 +589,15 @@
                     class="clip"
                     class:selected={i === selectedClip}
                     style="left: {(entry.start / 1000) * pxPerSecond}px; width: {(entry.duration / 1000) * pxPerSecond}px"
-                    onpointerdown={(e) => {
+                    onclick={(e) => {
                       e.stopPropagation();
                       selectedClip = i;
+                    }}
+                    onkeydown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        selectedClip = i;
+                      }
                     }}
                     role="button"
                     tabindex="0"
@@ -539,7 +618,13 @@
         </div>
       </div>
 
-      <div class="effects">
+      <div
+        class="splitter-v"
+        role="separator"
+        aria-label="Resize effects panel"
+        onpointerdown={(e) => beginResize("effects", e)}
+      ></div>
+      <div class="effects" style="width: {effectsWidth}px">
         <div class="effects-head">
           <span>Effects</span>
           <span class="dim">clip {selectedClip + 1}</span>
@@ -597,6 +682,7 @@
   }
 
   .ui-bottom {
+    height: var(--bottom-h, 300px);
     height: 300px;
     display: flex;
     flex-direction: column;
@@ -638,6 +724,21 @@
   .timecode .dim { color: var(--text-muted); }
 
   .spacer { flex: 1; }
+
+  .splitter-h {
+    height: 4px;
+    cursor: row-resize;
+    background: var(--border);
+    flex: 0 0 auto;
+  }
+  .splitter-h:hover { background: var(--accent); }
+  .splitter-v {
+    width: 4px;
+    cursor: col-resize;
+    background: var(--border);
+    flex: 0 0 auto;
+  }
+  .splitter-v:hover { background: var(--accent); }
 
   .effects {
     width: 228px;

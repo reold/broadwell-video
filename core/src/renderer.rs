@@ -104,6 +104,8 @@ pub struct PreviewRenderer {
     pub map_seek_count: u64,
     /// Surface sync failures seen, which are the driver's and are recovered from.
     pub map_failures: u64,
+    /// The look version whose frames the ring holds.
+    look_version_seen: u64,
     pub map_warm_time: Duration,
     pub map_warm_count: u64,
     pub import_time: Duration,
@@ -259,6 +261,7 @@ impl PreviewRenderer {
             map_seek_time: Duration::ZERO,
             map_seek_count: 0,
             map_failures: 0,
+            look_version_seen: 0,
             map_warm_time: Duration::ZERO,
             map_warm_count: 0,
             import_time: Duration::ZERO,
@@ -338,6 +341,16 @@ impl PreviewRenderer {
             return Ok(FrameOutcome::Paused);
         }
         let exporting = self.export.is_some();
+
+        // An effect changed, so every graded frame in the ring is stale.
+        {
+            let version = self.state.lock().unwrap().look_version;
+            if version != self.look_version_seen {
+                self.look_version_seen = version;
+                self.ring_clear();
+                self.texture_cache.clear();
+            }
+        }
 
         // ---- A resident frame may already cover this target ----
         //

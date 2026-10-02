@@ -172,6 +172,19 @@ impl Edit {
             }
         }
         s.refresh_duration();
+        if self.changes_look() {
+            s.look_version += 1;
+        }
+        s.dirty = true;
+    }
+
+    /// Whether applying this edit changes what a frame looks like, as opposed to
+    /// where the frames come from.
+    pub fn changes_look(&self) -> bool {
+        matches!(
+            self,
+            Edit::InsertEffect { .. } | Edit::RemoveEffect { .. } | Edit::SetEffect { .. }
+        )
     }
 
     pub fn invert(&self) -> Edit {
@@ -311,6 +324,15 @@ pub struct EditorState {
     /// Edits that can be undone, oldest first, and edits that can be redone.
     undo: Vec<Edit>,
     redo: Vec<Edit>,
+    /// Bumped whenever an edit changes what a frame should look like.
+    ///
+    /// Graded frames live in the renderer's ring. An effect change makes every
+    /// one of them stale, and without this the ring goes on serving the old look
+    /// until each frame happens to be decoded again -- which is why a grade
+    /// appeared to apply itself only after scrubbing back and forth a few times.
+    pub look_version: u64,
+    /// Set when something changed that the UI has not been told about yet.
+    pub dirty: bool,
 }
 
 /// Where an export has got to.
@@ -378,6 +400,8 @@ impl EditorState {
             export: None,
             undo: Vec::new(),
             redo: Vec::new(),
+            look_version: 0,
+            dirty: false,
         }
     }
 
