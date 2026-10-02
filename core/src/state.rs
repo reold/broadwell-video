@@ -323,22 +323,49 @@ impl Edit {
         }
     }
 
-    /// Whether a new edit should fold into the one before it.
+    /// What this edit changes, for folding.
     ///
-    /// Dragging a slider produces an edit per pointer move. Without this the undo
-    /// stack fills with the drag's intermediate states and a single undo goes
-    /// back one pixel.
-    pub fn coalesces_with(&self, other: &Edit) -> bool {
-        match (self, other) {
-            (
-                Edit::SetEffect { clip: a, at: ai, .. },
-                Edit::SetEffect { clip: b, at: bi, .. },
-            ) => a == b && ai == bi,
-            (
-                Edit::SetTransform { clip: a, .. },
-                Edit::SetTransform { clip: b, .. },
-            ) => a == b,
-            _ => false,
+    /// Two edits fold into one undo step only when they are the same kind of
+    /// change to the same thing: dragging a corner, or one slider, or the body.
+    /// Folding on identity alone made a move and a resize into a single step,
+    /// and matching only on the edit's variant meant a whole drag was one step
+    /// per pointer move.
+    ///
+    /// Real editors bound this by an explicit gesture -- `NSUndoManager` groups
+    /// by event loop pass, Blender by action -- because the boundary is a
+    /// pointer going down and coming up. This takes the cheaper approximation:
+    /// the boundary is a change of subject. The one case it does not separate is
+    /// two identical drags with nothing in between, which is a fair trade for
+    /// not threading a group through every control.
+    fn fold_key(&self) -> Option<(u8, usize, usize, u8)> {
+        match *self {
+            Edit::SetTransform {
+                clip,
+                before,
+                after,
+            } => {
+                let bits = u8::from(before.scale != after.scale)
+                    | (u8::from(before.offset_x != after.offset_x) << 1)
+                    | (u8::from(before.offset_y != after.offset_y) << 2)
+                    | (u8::from(before.rotation != after.rotation) << 3);
+                (bits != 0).then_some((0, clip, 0, bits))
+            }
+            Edit::SetEffect {
+                clip,
+                at,
+                before,
+                after,
+            } => {
+                let (b, a) = match (before, after) {
+                    (Effect::Grade(b), Effect::Grade(a)) => (b, a),
+                };
+                let bits = u8::from(b.exposure != a.exposure)
+                    | (u8::from(b.contrast != a.contrast) << 1)
+                    | (u8::from(b.saturation != a.saturation) << 2)
+                    | (u8::from(b.gamma != a.gamma) << 3);
+                (bits != 0).then_some((1, clip, at, bits))
+            }
+            _ => None,
         }
     }
 }
@@ -533,10 +560,21 @@ impl EditorState {
     /// A repeated `SetEffect` on the same node folds into the one before it, so a
     /// slider drag is one undo step rather than a hundred.
     pub fn push_edit(&mut self, edit: Edit) {
-        let folded = match (self.undo.last_mut(), &edit) {
-            (Some(prev), Edit::SetEffect { after, .. }) if prev.coalesces_with(&edit) => {
-                if let Edit::SetEffect { after: slot, .. } = prev {
-                    *slot = *after;
+        // Fold into the edit before, if it is the same gesture on the same
+        // thing. Only `SetEffect` was matched here, so a slider coalesced and a
+        // handle drag did not: every step of a resize became its own undo.
+        // The new value replaces `after`; `before` is left alone, because that
+        // is what one undo has to return to.
+        let folded = match (self.undo.last_mut(), edit.fold_key()) {
+            (Some(prev), Some(key)) if prev.fold_key() == Some(key) => {
+                match (prev, &edit) {
+                    (Edit::SetEffect { after: slot, .. }, Edit::SetEffect { after, .. }) => {
+                        *slot = *after
+                    }
+                    (Edit::SetTransform { after: slot, .. }, Edit::SetTransform { after, .. }) => {
+                        *slot = *after
+                    }
+                    _ => {}
                 }
                 true
             }
@@ -881,5 +919,100 @@ mod transform_tests {
         });
         assert_eq!(s.clips[0].transform.scale, 0.5);
         assert_eq!(s.clips[1].transform.scale, 0.5);
+    }
+}
+
+#[cfg(test)]
+mod undo_granularity_tests {
+    use super::*;
+
+    fn one_clip() -> EditorState {
+        let mut s = EditorState::new();
+        s.clips = vec![Clip::new(0, 1000)];
+        s.refresh_duration();
+        s
+    }
+
+    #[test]
+    fn a_handle_drag_is_one_undo_step() {
+        let mut s = one_clip();
+        for scale in [0.9, 0.8, 0.7, 0.6] {
+            let before = s.clips[0].transform;
+            s.push_edit(Edit::SetTransform {
+                clip: 0,
+                before,
+                after: Transform {
+                    scale,
+                    ..before
+                },
+            });
+        }
+        assert_eq!(s.clips[0].transform.scale, 0.6);
+        // Four gestures' worth of events, one thing to undo.
+        assert_eq!(s.undo_depth(), 1);
+        assert!(s.undo());
+        assert_eq!(s.clips[0].transform.scale, 1.0);
+    }
+
+    #[test]
+    fn moving_and_scaling_are_separate_undo_steps() {
+        let mut s = one_clip();
+        let before = s.clips[0].transform;
+        s.push_edit(Edit::SetTransform {
+            clip: 0,
+            before,
+            after: Transform {
+                scale: 0.5,
+                ..before
+            },
+        });
+        let before = s.clips[0].transform;
+        s.push_edit(Edit::SetTransform {
+            clip: 0,
+            before,
+            after: Transform {
+                offset_x: 0.25,
+                ..before
+            },
+        });
+        // Different gestures, even on the same clip: two steps.
+        assert_eq!(s.undo_depth(), 2);
+        assert!(s.undo());
+        assert_eq!(s.clips[0].transform.offset_x, 0.0);
+        assert_eq!(s.clips[0].transform.scale, 0.5);
+    }
+
+    #[test]
+    fn a_scale_drag_does_not_swallow_a_later_one() {
+        let mut s = one_clip();
+        let before = s.clips[0].transform;
+        s.push_edit(Edit::SetTransform {
+            clip: 0,
+            before,
+            after: Transform {
+                scale: 0.5,
+                ..before
+            },
+        });
+        // Something else happens in between, so the next drag is its own step.
+        let before = s.clips[0].transform;
+        s.push_edit(Edit::SetTransform {
+            clip: 0,
+            before,
+            after: Transform {
+                rotation: 0.5,
+                ..before
+            },
+        });
+        let before = s.clips[0].transform;
+        s.push_edit(Edit::SetTransform {
+            clip: 0,
+            before,
+            after: Transform {
+                scale: 0.25,
+                ..before
+            },
+        });
+        assert_eq!(s.undo_depth(), 3);
     }
 }
