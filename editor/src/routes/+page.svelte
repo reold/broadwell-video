@@ -3,11 +3,14 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 
+  type Clip = { in_ms: number; out_ms: number };
+
   type StateSnapshot = {
     playing: boolean;
     position_ms: number;
     duration_ms: number;
     fps: number;
+    clips: Clip[];
   };
 
   type ExportProgress = {
@@ -30,6 +33,8 @@
       : 0
   );
 
+  let clips = $state<Clip[]>([]);
+  let selectedClip = $state(0);
   let positionMs = $state(0);
   let durationMs = $state(60_000);
   let playing = $state(true);
@@ -38,6 +43,18 @@
   let pxPerSecond = $state(40);
   let dragging = $state(false);
   let lanesEl: HTMLDivElement;
+
+  /// Where each clip sits on the timeline, in order. The core keeps the clips;
+  /// this only lays them out to be drawn.
+  let clipLayout = $derived.by(() => {
+    let start = 0;
+    return clips.map((clip) => {
+      const duration = Math.max(0, clip.out_ms - clip.in_ms);
+      const entry = { start, duration };
+      start += duration;
+      return entry;
+    });
+  });
 
   let playheadPx = $derived((positionMs / 1000) * pxPerSecond);
   let totalSeconds = $derived(durationMs / 1000);
@@ -77,6 +94,7 @@
       durationMs = s.duration_ms || 60_000;
       playing = s.playing;
       if (s.fps > 0) fps = s.fps;
+      clips = s.clips ?? [];
     });
 
     invoke<string>("default_export_path").then((p) => {
@@ -91,6 +109,7 @@
       durationMs = s.duration_ms || durationMs;
       playing = s.playing;
       if (s.fps > 0) fps = s.fps;
+      clips = s.clips ?? [];
     });
 
     const unlistenExport = listen<ExportProgress>("export_progress", (event) => {
@@ -198,6 +217,25 @@
   function stepSeconds(n: number) {
     pauseForStep();
     seekTo(positionMs + n * 1000);
+  }
+
+  // ---- Editing ----
+  //
+  // The clips are the core's; these just ask it to change them. The snapshot
+  // comes back twenty times a second, so the timeline redraws itself.
+
+  function splitAtPlayhead() {
+    invoke("split_at_playhead").catch(() => {});
+  }
+
+  function deleteSelected() {
+    invoke("delete_clip", { index: selectedClip }).catch(() => {});
+    if (selectedClip > 0) selectedClip -= 1;
+  }
+
+  function resetTimeline() {
+    invoke("reset_timeline").catch(() => {});
+    selectedClip = 0;
   }
 
   // ---- Drag handling with global listeners ----
@@ -327,6 +365,26 @@
           {/if}
         {/if}
       </div>
+      <div class="edit">
+        <button
+          type="button"
+          title="Split the clip under the playhead"
+          onclick={splitAtPlayhead}
+        >
+          Split
+        </button>
+        <button
+          type="button"
+          title="Delete the selected clip"
+          onclick={deleteSelected}
+          disabled={clips.length <= 1}
+        >
+          Delete
+        </button>
+        <button type="button" title="Put the whole file back" onclick={resetTimeline}>
+          Reset
+        </button>
+      </div>
       <div class="zoom">
         <span>zoom</span>
         <input type="range" min="10" max="200" bind:value={pxPerSecond} />
@@ -367,13 +425,24 @@
           {#each [0, 1, 2] as lane}
             <div class="lane">
               {#if lane === 1}
-                <!-- The loaded media, as the span it occupies. Not an editable
-                     clip yet: the core has one video and no clip list. -->
-                <div class="clip" style="width: {totalSeconds * pxPerSecond}px">
-                  <span class="clip-label selectable">
-                    {formatTc(totalSeconds, false)}
-                  </span>
-                </div>
+                {#each clipLayout as entry, i}
+                  <div
+                    class="clip"
+                    class:selected={i === selectedClip}
+                    style="left: {(entry.start / 1000) * pxPerSecond}px; width: {(entry.duration / 1000) * pxPerSecond}px"
+                    onpointerdown={(e) => {
+                      e.stopPropagation();
+                      selectedClip = i;
+                    }}
+                    role="button"
+                    tabindex="0"
+                    aria-label="Clip {i + 1}"
+                  >
+                    <span class="clip-label selectable">
+                      {formatTc(entry.duration / 1000, false)}
+                    </span>
+                  </div>
+                {/each}
               {/if}
             </div>
           {/each}
@@ -446,6 +515,20 @@
   .timecode .dim { color: var(--text-muted); }
 
   .spacer { flex: 1; }
+
+  .edit { display: flex; gap: 6px; align-items: center; margin-right: 12px; }
+  .edit button {
+    background: var(--bg-widget);
+    border: 1px solid var(--border);
+    color: var(--text);
+    height: 24px;
+    padding: 0 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: var(--font-size-sm);
+  }
+  .edit button:hover:not(:disabled) { background: var(--bg-hover); }
+  .edit button:disabled { color: var(--text-muted); cursor: default; }
 
   .zoom { display: flex; align-items: center; gap: 8px; color: var(--text-dim); }
   .zoom input[type="range"] { width: 120px; accent-color: var(--accent); }
@@ -569,7 +652,6 @@
     position: absolute;
     top: 3px;
     bottom: 3px;
-    left: 0;
     background: var(--clip-video);
     border: 1px solid var(--accent);
     border-radius: 3px;
@@ -578,6 +660,8 @@
     display: flex;
     align-items: center;
   }
+  .clip.selected { border-color: var(--playhead); background: #46698c; }
+
   .clip-label {
     padding: 0 6px;
     font-family: var(--font-mono);

@@ -152,6 +152,17 @@ impl PreviewRenderer {
         // Before the decoder opens a VA-API device.
         crate::select_vaapi_driver();
         let ff = unsafe { ffmpeg::Handles::open(video_path, "/dev/dri/renderD128")? };
+        // A file nobody has cut yet is one clip covering all of it. The renderer
+        // is where the duration is first known, so it is where the timeline
+        // starts life.
+        {
+            let mut s = state.lock().unwrap();
+            if s.clips.is_empty() && ff.duration_ms > 0 {
+                s.reset_timeline(ff.duration_ms);
+            }
+            s.fps = ff.fps;
+            s.duration_ms = s.duration_ms.max(0);
+        }
         let vw = ff.width;
         let vh = ff.height;
         println!(
@@ -359,7 +370,7 @@ impl PreviewRenderer {
         // Scrubbing served from the ring leaves the decoder wherever it was, so
         // re-anchor it when playback resumes.
         if playing && !self.was_playing {
-            let resume_ms = self.state.lock().unwrap().position_ms;
+            let resume_ms = self.state.lock().unwrap().pending_seek_ms.unwrap_or(0);
             unsafe {
                 self.ff.seek_to_ms(resume_ms)?;
             }
@@ -409,7 +420,12 @@ impl PreviewRenderer {
                             // Dragged past the end of the file. Hold the last
                             // frame rather than rewinding under a cursor that is
                             // still moving.
-                            self.state.lock().unwrap().position_ms = self.last_pts;
+                            let tl = self
+                                .state
+                                .lock()
+                                .unwrap()
+                                .timeline_for_source(self.last_pts);
+                            self.state.lock().unwrap().position_ms = tl;
                             return Ok(FrameOutcome::Skipped);
                         }
                         self.ff.rewind();
@@ -418,6 +434,7 @@ impl PreviewRenderer {
                 }
 
                 let pts = self.ff.current_pts_ms();
+
                 self.last_pts = pts;
 
                 match self.prune_to_ms {
@@ -436,8 +453,49 @@ impl PreviewRenderer {
                     None => {}
                 }
 
-                // This is the frame we render.
-                self.state.lock().unwrap().position_ms = pts;
+                // Clip boundary, checked only once no prune is in flight.
+                //
+                // The prune above is what makes a seek land on its target: a
+                // seek stops at a keyframe *before* the requested time and the
+                // loop decodes forward from there. Checking the boundary before
+                // that would see the pre-target position, seek to the same
+                // place, and do it forever. So this runs when the timeline is
+                // settled, and its own jump is a pending seek like any other,
+                // which the loop above turns into a seek plus a prune.
+                if self.prune_to_ms.is_none() {
+                    let jump = {
+                        let s = self.state.lock().unwrap();
+                        if s.clips.iter().any(|c| c.contains(pts)) {
+                            None
+                        } else if s.clips.last().is_some_and(|last| pts >= last.out_ms) {
+                            Some(None)
+                        } else {
+                            s.next_clip_in(pts).map(Some)
+                        }
+                    };
+                    match jump {
+                        Some(Some(in_ms)) => {
+                            av_frame_unref(self.ff.decoded);
+                            self.state.lock().unwrap().pending_seek_ms = Some(in_ms);
+                            continue;
+                        }
+                        Some(None) => {
+                            av_frame_unref(self.ff.decoded);
+                            if self.export.is_some() {
+                                return Ok(FrameOutcome::Eof);
+                            }
+                            return Ok(FrameOutcome::Skipped);
+                        }
+                        None => {}
+                    }
+                }
+
+                // This is the frame we render. The state speaks timeline
+                // milliseconds; the decoder speaks source milliseconds.
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.position_ms = s.timeline_for_source(pts);
+                }
                 break;
             }
 
@@ -668,12 +726,14 @@ impl PreviewRenderer {
         self.last_pts = 0;
         // A seek left over from moving the playhead would otherwise be picked up
         // by the first export frame and start the file somewhere else.
+        self.encoder_imports.clear();
+        // Start at the head of the timeline, which is not necessarily the head
+        // of the file once the media has been cut.
         {
             let mut s = self.state.lock().unwrap();
-            s.pending_seek_ms = None;
             s.position_ms = 0;
+            s.pending_seek_ms = s.clips.first().map(|c| c.in_ms);
         }
-        self.encoder_imports.clear();
         self.export = Some(crate::encoder::VaapiEncoder::new(
             output,
             self.ff.width,

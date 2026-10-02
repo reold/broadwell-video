@@ -92,6 +92,32 @@ impl Runner {
 
         let state = state::new_shared();
         state.lock().unwrap().video_path = self.clip.clone();
+
+        // Optional: cut the timeline up, so the clip walk is exercised. Source
+        // ranges in milliseconds, comma separated:
+        //   HWA_TEST_CLIPS="0-5000,10000-15000"
+        if let Ok(spec) = std::env::var("HWA_TEST_CLIPS") {
+            let clips: Vec<hwa_core::state::Clip> = spec
+                .split(',')
+                .filter_map(|part| {
+                    let (a, b) = part.split_once('-')?;
+                    Some(hwa_core::state::Clip {
+                        in_ms: a.trim().parse().ok()?,
+                        out_ms: b.trim().parse().ok()?,
+                    })
+                })
+                .collect();
+            if !clips.is_empty() {
+                let mut s = state.lock().unwrap();
+                s.clips = clips;
+                s.refresh_duration();
+                println!(
+                    "timeline: {} clips, {:.2}s",
+                    s.clips.len(),
+                    s.duration_ms as f64 / 1000.0
+                );
+            }
+        }
         let mut renderer = PreviewRenderer::new(host, &self.clip, format, state.clone())?;
 
         if let Some(frames) = self.play_frames {

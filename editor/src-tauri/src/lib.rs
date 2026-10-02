@@ -49,9 +49,67 @@ fn set_paused(state: State<'_, SharedState>, paused: bool) {
 fn seek_to(state: State<'_, SharedState>, ms: i64) {
     // Deliberately not logged: an unthrottled drag calls this on every pointer
     // move. The periodic stats line reports the seek rate instead.
+    //
+    // The UI speaks timeline milliseconds and the renderer's queue speaks source
+    // milliseconds, so this is where the edit is applied to a seek.
     let mut s = state.lock().unwrap();
-    s.pending_seek_ms = Some(ms);
-    s.position_ms = ms;
+    let clamped = ms.clamp(0, s.duration_ms.max(0));
+    s.position_ms = clamped;
+    s.pending_seek_ms = s.source_for_timeline(clamped).map(|(_, source)| source);
+}
+
+/// Cut the clip under the playhead in two, at the playhead.
+#[tauri::command]
+fn split_at_playhead(state: State<'_, SharedState>) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    let at = s.position_ms;
+    let Some((index, source)) = s.source_for_timeline(at) else {
+        return Err("nothing to split".into());
+    };
+    let clip = s.clips[index];
+    // A cut at either end would make a zero length clip, which is only a way to
+    // lose frames.
+    if source <= clip.in_ms || source >= clip.out_ms {
+        return Err("the playhead is at a clip edge".into());
+    }
+    s.clips[index].out_ms = source;
+    s.clips.insert(
+        index + 1,
+        hwa_core::state::Clip {
+            in_ms: source,
+            out_ms: clip.out_ms,
+        },
+    );
+    s.refresh_duration();
+    Ok(())
+}
+
+/// Remove a clip from the timeline.
+#[tauri::command]
+fn delete_clip(state: State<'_, SharedState>, index: usize) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    if index >= s.clips.len() {
+        return Err(format!("no clip {index}"));
+    }
+    s.clips.remove(index);
+    s.refresh_duration();
+    if let Some((_, source)) = s.source_for_timeline(s.position_ms) {
+        s.pending_seek_ms = Some(source);
+    }
+    Ok(())
+}
+
+/// Put the whole file back on the timeline as one clip.
+#[tauri::command]
+fn reset_timeline(state: State<'_, SharedState>) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    let whole = s.clips.iter().map(|c| c.out_ms).max().unwrap_or(0);
+    if whole <= 0 {
+        return Err("no media loaded".into());
+    }
+    s.reset_timeline(whole);
+    s.pending_seek_ms = Some(0);
+    Ok(())
 }
 
 /// Where an export would go if the user just hits the button: next to the clip
@@ -575,6 +633,9 @@ pub fn run() {
             seek_to,
             default_export_path,
             start_export,
+            split_at_playhead,
+            delete_clip,
+            reset_timeline,
             cancel_export,
         ])
         .setup(move |app| {
