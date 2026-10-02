@@ -185,6 +185,7 @@
     if (e.button !== 0 || !clip || !picture || !fit) return;
     e.preventDefault();
     e.stopPropagation();
+    beginUndoGroup();
     const dx = e.clientX - picture.cx;
     const dy = e.clientY - picture.cy;
     handleDrag = {
@@ -246,6 +247,14 @@
   function endHandleDrag() {
     handleDrag = null;
     window.removeEventListener("pointermove", onHandleMove);
+  }
+
+  /// Open one undo step for a gesture. Called when a pointer goes down on
+  /// anything draggable, so a whole drag is one Ctrl+Z and two drags are two --
+  /// which is the boundary real editors use, and the one thing folding by
+  /// subject could not express.
+  function beginUndoGroup() {
+    invoke("begin_undo_group").catch(() => {});
   }
 
   function applyTransform(transform: Transform) {
@@ -1066,6 +1075,7 @@
                   max={control.max}
                   step={control.step}
                   value={clips[selectedClip].transform[control.k]}
+                  onpointerdown={beginUndoGroup}
                   oninput={(e) =>
                     setTransformParam(control.k, Number(e.currentTarget.value))}
                 />
@@ -1109,6 +1119,7 @@
                     max={control.max}
                     step={control.step}
                     value={effect.Grade[control.k]}
+                    onpointerdown={beginUndoGroup}
                     oninput={(e) =>
                       setGradeParam(i, control.k, Number(e.currentTarget.value))}
                   />

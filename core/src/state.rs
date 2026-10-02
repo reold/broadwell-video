@@ -462,8 +462,14 @@ pub struct EditorState {
     /// The export in flight or the last one to finish.
     pub export: Option<ExportJob>,
     /// Edits that can be undone, oldest first, and edits that can be redone.
-    undo: Vec<Edit>,
-    redo: Vec<Edit>,
+    /// Each carries the gesture group it belongs to, because that -- not the
+    /// shape of the edit -- is the true boundary of an undo step.
+    undo: Vec<(u64, Edit)>,
+    redo: Vec<(u64, Edit)>,
+    /// The gesture in progress. The frontend opens one when a pointer goes down
+    /// on something draggable, which is what NSUndoManager's `groupsByEvent`
+    /// and Blender's undo steps are both approximating.
+    undo_group: u64,
     /// Bumped whenever an edit changes what a frame should look like.
     ///
     /// Graded frames live in the renderer's ring. An effect change makes every
@@ -550,23 +556,32 @@ impl EditorState {
             export: None,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_group: 0,
             look_version: 0,
             dirty: false,
         }
     }
 
+    /// Open a new gesture. Everything pushed until the next one folds together.
+    ///
+    /// Called when a pointer goes down on a handle or a slider. This is the
+    /// model the good ones use: the boundary of an undo step is the gesture, not
+    /// the shape of the change, so two identical drags in a row are two steps
+    /// and a single drag is one, whatever it touches on the way.
+    pub fn begin_undo_group(&mut self) {
+        self.undo_group = self.undo_group.wrapping_add(1);
+    }
+
     /// Apply an edit, and remember how to undo it.
     ///
-    /// A repeated `SetEffect` on the same node folds into the one before it, so a
-    /// slider drag is one undo step rather than a hundred.
+    /// Folds into the edit before it only when it belongs to the same gesture
+    /// *and* changes the same thing, so a drag that moves and then, in the same
+    /// gesture, resizes is still two steps if the user meant two things.
     pub fn push_edit(&mut self, edit: Edit) {
-        // Fold into the edit before, if it is the same gesture on the same
-        // thing. Only `SetEffect` was matched here, so a slider coalesced and a
-        // handle drag did not: every step of a resize became its own undo.
-        // The new value replaces `after`; `before` is left alone, because that
-        // is what one undo has to return to.
         let folded = match (self.undo.last_mut(), edit.fold_key()) {
-            (Some(prev), Some(key)) if prev.fold_key() == Some(key) => {
+            (Some((group, prev)), Some(key))
+                if *group == self.undo_group && prev.fold_key() == Some(key) =>
+            {
                 match (prev, &edit) {
                     (Edit::SetEffect { after: slot, .. }, Edit::SetEffect { after, .. }) => {
                         *slot = *after
@@ -581,17 +596,21 @@ impl EditorState {
             _ => false,
         };
         if !folded {
-            self.undo.push(edit.clone());
+            let group = self.undo_group;
+            self.undo.push((group, edit.clone()));
         }
         edit.apply(self);
         self.redo.clear();
     }
 
     pub fn undo(&mut self) -> bool {
-        if let Some(edit) = self.undo.pop() {
+        if let Some((group, edit)) = self.undo.pop() {
             let inverse = edit.invert();
             inverse.apply(self);
-            self.redo.push(edit);
+            self.redo.push((group, edit));
+            // An edit made after an undo starts a new step rather than folding
+            // into whatever the undo exposed.
+            self.undo_group = self.undo_group.wrapping_add(1);
             true
         } else {
             false
@@ -599,9 +618,10 @@ impl EditorState {
     }
 
     pub fn redo(&mut self) -> bool {
-        if let Some(edit) = self.redo.pop() {
+        if let Some((group, edit)) = self.redo.pop() {
             edit.apply(self);
-            self.undo.push(edit);
+            self.undo.push((group, edit));
+            self.undo_group = self.undo_group.wrapping_add(1);
             true
         } else {
             false
@@ -1014,5 +1034,105 @@ mod undo_granularity_tests {
             },
         });
         assert_eq!(s.undo_depth(), 3);
+    }
+}
+
+#[cfg(test)]
+mod gesture_tests {
+    use super::*;
+
+    fn one_clip() -> EditorState {
+        let mut s = EditorState::new();
+        s.clips = vec![Clip::new(0, 1000)];
+        s.refresh_duration();
+        s
+    }
+
+    fn set_scale(s: &mut EditorState, scale: f32) {
+        let before = s.clips[0].transform;
+        s.push_edit(Edit::SetTransform {
+            clip: 0,
+            before,
+            after: Transform { scale, ..before },
+        });
+    }
+
+    #[test]
+    fn two_identical_drags_in_a_row_are_two_steps() {
+        let mut s = one_clip();
+
+        // First drag: pointer down, four moves, pointer up.
+        s.begin_undo_group();
+        for scale in [0.9, 0.8, 0.7, 0.6] {
+            set_scale(&mut s, scale);
+        }
+
+        // Second drag, same thing again. Without a group this folded into the
+        // first, which is the case the gesture boundary exists to separate.
+        s.begin_undo_group();
+        for scale in [0.5, 0.4] {
+            set_scale(&mut s, scale);
+        }
+
+        assert_eq!(s.undo_depth(), 2);
+        assert!(s.undo());
+        assert_eq!(s.clips[0].transform.scale, 0.6);
+        assert!(s.undo());
+        assert_eq!(s.clips[0].transform.scale, 1.0);
+    }
+
+    #[test]
+    fn a_drag_that_moves_and_then_resizes_is_one_step_per_subject() {
+        let mut s = one_clip();
+        s.begin_undo_group();
+
+        let before = s.clips[0].transform;
+        s.push_edit(Edit::SetTransform {
+            clip: 0,
+            before,
+            after: Transform {
+                offset_x: 0.1,
+                ..before
+            },
+        });
+        let before = s.clips[0].transform;
+        s.push_edit(Edit::SetTransform {
+            clip: 0,
+            before,
+            after: Transform {
+                offset_x: 0.2,
+                ..before
+            },
+        });
+        assert_eq!(s.undo_depth(), 1, "two moves in one gesture fold");
+
+        let before = s.clips[0].transform;
+        s.push_edit(Edit::SetTransform {
+            clip: 0,
+            before,
+            after: Transform {
+                scale: 0.5,
+                ..before
+            },
+        });
+        assert_eq!(s.undo_depth(), 2, "a resize is a different subject");
+    }
+
+    #[test]
+    fn an_edit_after_an_undo_does_not_fold_into_the_restored_past() {
+        let mut s = one_clip();
+        s.begin_undo_group();
+        set_scale(&mut s, 0.5);
+        s.begin_undo_group();
+        set_scale(&mut s, 0.25);
+        assert!(s.undo());
+        assert_eq!(s.clips[0].transform.scale, 0.5);
+
+        // Undo left the group open on the older edit; a new drag must not add
+        // itself to it.
+        set_scale(&mut s, 0.9);
+        assert_eq!(s.undo_depth(), 2);
+        assert!(s.undo());
+        assert_eq!(s.clips[0].transform.scale, 0.5);
     }
 }

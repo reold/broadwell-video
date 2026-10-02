@@ -132,6 +132,12 @@ fn reset_timeline(state: State<'_, SharedState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Open a gesture, so everything until the next one is a single undo step.
+#[tauri::command]
+fn begin_undo_group(state: State<'_, SharedState>) {
+    state.lock().unwrap().begin_undo_group();
+}
+
 #[tauri::command]
 fn undo(state: State<'_, SharedState>) -> bool {
     state.lock().unwrap().undo()
@@ -915,6 +921,7 @@ pub fn run() {
             split_at_playhead,
             delete_clip,
             reset_timeline,
+            begin_undo_group,
             undo,
             redo,
             add_grade,
