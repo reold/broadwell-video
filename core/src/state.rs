@@ -86,6 +86,18 @@ pub enum Edit {
         index: usize,
         before: Clip,
     },
+    /// Reorder: take the clip at `from` and put it where `to` is.
+    MoveClip {
+        from: usize,
+        to: usize,
+    },
+    /// Change a clip's source range. Carries both ends so the inverse is just
+    /// the swap, which is why a trim does not need to know which edge moved.
+    TrimClip {
+        index: usize,
+        before: Clip,
+        after: Clip,
+    },
     InsertEffect {
         clip: usize,
         at: usize,
@@ -146,6 +158,17 @@ impl Edit {
             Edit::DeleteClip { index, .. } => {
                 if index < s.clips.len() {
                     s.clips.remove(index);
+                }
+            }
+            Edit::MoveClip { from, to } => {
+                if from < s.clips.len() && to < s.clips.len() {
+                    let clip = s.clips.remove(from);
+                    s.clips.insert(to, clip);
+                }
+            }
+            Edit::TrimClip { index, after, .. } => {
+                if let Some(slot) = s.clips.get_mut(index) {
+                    *slot = after;
                 }
             }
             Edit::InsertEffect { clip, at, effect } => {
@@ -212,6 +235,19 @@ impl Edit {
                 before: clip,
             },
             Edit::DeleteClip { index, before } => Edit::InsertClip { index, clip: before },
+            Edit::MoveClip { from, to } => Edit::MoveClip {
+                from: to,
+                to: from,
+            },
+            Edit::TrimClip {
+                index,
+                before,
+                after,
+            } => Edit::TrimClip {
+                index,
+                before: after,
+                after: before,
+            },
             Edit::InsertEffect { clip, at, effect } => Edit::RemoveEffect { clip, at, effect },
             Edit::RemoveEffect { clip, at, effect } => Edit::InsertEffect { clip, at, effect },
             Edit::SetEffect {
@@ -642,5 +678,69 @@ mod tests {
         assert_eq!(g.to_array(), [0.0, 1.0, 1.4, 1.1]);
         // A clip with no effects grades with the default.
         assert_eq!(Clip::new(0, 100).grade(), g);
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+
+    fn three() -> EditorState {
+        let mut s = EditorState::new();
+        s.clips = vec![Clip::new(0, 1000), Clip::new(2000, 3000), Clip::new(5000, 6000)];
+        s.refresh_duration();
+        s
+    }
+
+    #[test]
+    fn moving_a_clip_and_undoing_puts_the_order_back() {
+        let mut s = three();
+        let before = s.clips.clone();
+        s.push_edit(Edit::MoveClip { from: 0, to: 2 });
+        assert_eq!(s.clips[2].in_ms, 0);
+        assert_eq!(s.clips[0].in_ms, 2000);
+        assert_eq!(s.duration_ms, 3000);
+        assert!(s.undo());
+        assert_eq!(s.clips, before);
+    }
+
+    #[test]
+    fn trimming_and_undoing_restores_both_ends() {
+        let mut s = three();
+        let before = s.clips.clone();
+        let original = s.clips[0].clone();
+        let mut trimmed = original.clone();
+        trimmed.in_ms = 250;
+        trimmed.out_ms = 800;
+        s.push_edit(Edit::TrimClip {
+            index: 0,
+            before: original,
+            after: trimmed,
+        });
+        assert_eq!(s.clips[0].duration_ms(), 550);
+        assert_eq!(s.duration_ms, 2550);
+        assert!(s.undo());
+        assert_eq!(s.clips, before);
+    }
+
+    #[test]
+    fn a_clip_carries_its_effects_through_a_move_and_a_trim() {
+        let mut s = three();
+        s.clips[0].effects = vec![Effect::Grade(GradeParams {
+            exposure: 1.0,
+            ..Default::default()
+        })];
+        let moving = s.clips[0].clone();
+        s.push_edit(Edit::MoveClip { from: 0, to: 1 });
+        assert_eq!(s.clips[1].effects, moving.effects);
+        let mut trimmed = s.clips[1].clone();
+        trimmed.out_ms -= 100;
+        let original = s.clips[1].clone();
+        s.push_edit(Edit::TrimClip {
+            index: 1,
+            before: original,
+            after: trimmed,
+        });
+        assert_eq!(s.clips[1].grade().exposure, 1.0);
     }
 }

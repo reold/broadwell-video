@@ -142,6 +142,57 @@ fn redo(state: State<'_, SharedState>) -> bool {
     state.lock().unwrap().redo()
 }
 
+/// Reorder: put the clip at `from` where `to` is.
+#[tauri::command]
+fn move_clip(state: State<'_, SharedState>, from: usize, to: usize) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    if from >= s.clips.len() || to >= s.clips.len() {
+        return Err(format!("no clip {from} or {to}"));
+    }
+    if from == to {
+        return Ok(());
+    }
+    s.push_edit(hwa_core::state::Edit::MoveClip { from, to });
+    Ok(())
+}
+
+/// Change where a clip starts and ends in the source.
+#[tauri::command]
+fn trim_clip(
+    state: State<'_, SharedState>,
+    index: usize,
+    in_ms: i64,
+    out_ms: i64,
+) -> Result<(), String> {
+    let mut s = state.lock().unwrap();
+    let before = s
+        .clips
+        .get(index)
+        .cloned()
+        .ok_or_else(|| format!("no clip {index}"))?;
+    if out_ms <= in_ms {
+        return Err("a clip has to be at least one frame long".into());
+    }
+    let mut after = before.clone();
+    // In point first, then out point, each clamped against the other: a drag
+    // that runs off the end of the media otherwise produces a negative length
+    // clip, which the export would walk backwards through.
+    after.in_ms = in_ms.max(0).min(before.out_ms - 1);
+    after.out_ms = out_ms.max(after.in_ms + 1);
+    if after == before {
+        return Ok(());
+    }
+    s.push_edit(hwa_core::state::Edit::TrimClip {
+        index,
+        before,
+        after,
+    });
+    if let Some((_, source)) = s.source_for_timeline(s.position_ms) {
+        s.pending_seek_ms = Some(source);
+    }
+    Ok(())
+}
+
 /// Put a grade on a clip, so the effects panel has something to move.
 #[tauri::command]
 fn add_grade(state: State<'_, SharedState>, clip: usize) -> Result<(), String> {
@@ -811,6 +862,8 @@ pub fn run() {
             toggle_play,
             set_paused,
             set_ui_height,
+            move_clip,
+            trim_clip,
             seek_to,
             default_export_path,
             start_export,

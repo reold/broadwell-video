@@ -9,6 +9,7 @@
 //! usage: editor_export <clip> <output>          export the whole clip
 //!        editor_export <clip> play <frames>      present frames, no export
 //!        editor_export <clip> scrub <seconds>    drag the playhead about, no export
+//!        editor_export <clip> grade <steps>      drag a parameter slider, no export
 //!
 //! `hwa-preview`'s own `export` mode is left alone: it drives the subprocess
 //! path and stays the reference the in-process path is compared against.
@@ -33,6 +34,8 @@ struct Runner {
     /// Seconds of hard scrubbing, for reproducing what a drag can do to the
     /// decoder and the driver.
     scrub_seconds: Option<f64>,
+    /// Slider steps to make while paused, to check the picture stays put.
+    grade_steps: Option<u32>,
 }
 
 impl Runner {
@@ -141,6 +144,68 @@ impl Runner {
             }
         }
         let mut renderer = PreviewRenderer::new(host, &self.clip, format, state.clone())?;
+
+        if let Some(steps) = self.grade_steps {
+            // Settle on a frame, then move a parameter the way a drag does. The
+            // position must not change: a look change re-grades the frame that is
+            // on screen, and an earlier attempt let the decoder carry on, so each
+            // step walked the video forward.
+            state.lock().unwrap().playing = false;
+            let mid = state.lock().unwrap().duration_ms / 2;
+            let mut s = state.lock().unwrap();
+            s.position_ms = mid;
+            s.pending_seek_ms = s.source_for_timeline(mid).map(|(_, src)| src);
+            drop(s);
+            for _ in 0..4 {
+                let _ = renderer.render_frame(&surface, &config);
+            }
+            let start = state.lock().unwrap().position_ms;
+            println!("grade: settled at {start} ms");
+            let mut positions = Vec::new();
+            for step in 0..steps {
+                let mut s = state.lock().unwrap();
+                let clip = 0usize;
+                if s.clips[clip].effects.is_empty() {
+                    s.clips[clip].effects = vec![hwa_core::state::Effect::Grade(
+                        hwa_core::state::GradeParams::default(),
+                    )];
+                }
+                let before = s.clips[clip].effects[0];
+                let exposure = 0.05 * (step as f32 + 1.0);
+                let after = hwa_core::state::Effect::Grade(hwa_core::state::GradeParams {
+                    exposure,
+                    ..Default::default()
+                });
+                s.push_edit(hwa_core::state::Edit::SetEffect {
+                    clip,
+                    at: 0,
+                    before,
+                    after,
+                });
+                drop(s);
+                for _ in 0..3 {
+                    let _ = renderer.render_frame(&surface, &config);
+                }
+                let now = state.lock().unwrap().position_ms;
+                positions.push(now);
+            }
+            let moved = positions.windows(2).filter(|w| w[0] != w[1]).count();
+            let drift = positions.last().copied().unwrap_or(0) - start;
+            println!(
+                "grade: {} steps, position {} -> {} ({} changes, drift {} ms)",
+                steps,
+                start,
+                positions.last().copied().unwrap_or(0),
+                moved,
+                drift
+            );
+            if moved == 0 {
+                println!("grade: the picture did not move");
+            } else {
+                println!("grade: FAILED, the picture moved while a parameter was changed");
+            }
+            return Ok(());
+        }
 
         if let Some(seconds) = self.scrub_seconds {
             state.lock().unwrap().playing = false;
@@ -351,6 +416,11 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let grade_steps = if output == "grade" {
+        Some(args.next().unwrap_or_else(|| "12".to_string()).parse()?)
+    } else {
+        None
+    };
     let event_loop = EventLoop::new().map_err(|e| anyhow!("EventLoop: {e}"))?;
     event_loop
         .run_app(&mut Runner {
@@ -358,6 +428,7 @@ fn main() -> Result<()> {
             output,
             play_frames,
             scrub_seconds,
+            grade_steps,
         })
         .map_err(|e| anyhow!("run_app: {e}"))
 }

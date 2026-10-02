@@ -16,6 +16,35 @@
 
   type Clip = { in_ms: number; out_ms: number; effects: Effect[] };
 
+  /// Every icon is a path, never a character.
+  ///
+  /// Transport glyphs and arrows in a font are emoji on some systems and
+  /// missing on others, and they cannot take the theme's colour reliably. A
+  ///  16x16 path drawn in currentColor can.
+  const ICON: Record<string, string> = {
+    start: "M4 3h1.6v10H4zM13 3L6.8 8 13 13z",
+    rewind: "M2.5 3L8 8l-5.5 5zM8.5 3L14 8l-5.5 5z",
+    stepBack: "M12 3L6 8l6 5zM3.4 3H5v10H3.4z",
+    play: "M5 3l8 5-8 5z",
+    pause: "M5 3h2.2v10H5zM8.8 3H11v10H8.8z",
+    stepForward: "M4 3l6 5-6 5zM11 3h1.6v10H11z",
+    forward: "M7.5 3L2 8l5.5 5zM13.5 3L8 8l5.5 5z",
+    end: "M12 3h1.6v10H12zM3 3l6.2 5L3 13z",
+    undo: "M7 4.2V1.5L2.4 5.5 7 9.5V6.8c2.6.1 4.4 1.6 4.6 4.2.6-4.3-1.7-6.7-4.6-6.8z",
+    redo: "M9 4.2V1.5l4.6 4L9 9.5V6.8c-2.6.1-4.4 1.6-4.6 4.2-.6-4.3 1.7-6.7 4.6-6.8z",
+    close: "M11.6 5.4L8.9 8l2.7 2.6-1 1L8 9l-2.6 2.6-1-1L7.1 8 4.4 5.4l1-1L8 7l2.6-2.6z",
+    reset: "M8 3.2V1.2L4.2 4 8 6.8V4.7a3.6 3.6 0 1 1-3.5 4.4H3a5 5 0 1 0 5-5.9z",
+  };
+
+  /// What a reset returns a parameter to. Kept beside the controls so the two
+  /// cannot drift: these are the values the shaders shipped with.
+  const GRADE_DEFAULTS: GradeParams = {
+    exposure: 0,
+    contrast: 1,
+    saturation: 1.4,
+    gamma: 1.1,
+  };
+
   const GRADE_CONTROLS: {
     k: keyof GradeParams;
     label: string;
@@ -62,6 +91,21 @@
   let clips = $state<Clip[]>([]);
   let selectedClip = $state(0);
 
+  /// A clip drag in progress.
+  ///
+  /// The drag draws itself from this and nothing reaches the document until the
+  /// pointer comes up, so a drag is one edit and one undo step rather than a
+  /// hundred. `deltaMs` is shown as a ghost; the commit is on release.
+  let clipDrag = $state<null | {
+    index: number;
+    mode: "move" | "in" | "out";
+    startX: number;
+    deltaMs: number;
+    targetIndex: number;
+  }>(null);
+
+  const EDGE_PX = 6;
+
   // Panel sizes, remembered between runs. Blender's arrangement: every boundary
   // is somewhere the user can put it, and it stays put.
   let bottomHeight = $state(300);
@@ -97,6 +141,102 @@
     } catch {
       /* ignore */
     }
+  }
+
+  /// Which part of a clip the pointer went down on: an edge means trim, the
+  /// middle means move.
+  function beginClipDrag(index: number, e: PointerEvent) {
+    if (e.button !== 0) return;
+    const el = e.currentTarget as HTMLElement;
+    const box = el.getBoundingClientRect();
+    const offset = e.clientX - box.left;
+    const mode =
+      offset <= EDGE_PX ? "in" : offset >= box.width - EDGE_PX ? "out" : "move";
+    e.preventDefault();
+    e.stopPropagation();
+    selectedClip = index;
+    clipDrag = { index, mode, startX: e.clientX, deltaMs: 0, targetIndex: index };
+    window.addEventListener("pointermove", onClipDragMove);
+    window.addEventListener("pointerup", endClipDrag, { once: true });
+  }
+
+  /// Snap a delta to the frame grid, because a trim that lands between frames is
+  /// a trim nobody can see.
+  function snapMs(ms: number): number {
+    const frame = 1000 / (fps || 30);
+    return Math.round(ms / frame) * frame;
+  }
+
+  function onClipDragMove(e: PointerEvent) {
+    if (!clipDrag) return;
+    const deltaMs = ((e.clientX - clipDrag.startX) / pxPerSecond) * 1000;
+    let targetIndex = clipDrag.targetIndex;
+    if (clipDrag.mode === "move") {
+      // Where the pointer's centre would land on the timeline.
+      const entry = clipLayout[clipDrag.index];
+      const centre = entry.start + entry.duration / 2 + deltaMs;
+      let start = 0;
+      for (let i = 0; i < clipLayout.length; i += 1) {
+        const mid = start + clipLayout[i].duration / 2;
+        if (centre < mid) {
+          targetIndex = i;
+          break;
+        }
+        targetIndex = i;
+        start += clipLayout[i].duration;
+      }
+    }
+    clipDrag = { ...clipDrag, deltaMs, targetIndex };
+  }
+
+  function endClipDrag() {
+    const drag = clipDrag;
+    clipDrag = null;
+    window.removeEventListener("pointermove", onClipDragMove);
+    if (!drag) return;
+    const clip = clips[drag.index];
+    if (!clip) return;
+
+    if (drag.mode === "move") {
+      if (drag.targetIndex !== drag.index) {
+        invoke("move_clip", { from: drag.index, to: drag.targetIndex }).catch(() => {});
+        selectedClip = drag.targetIndex;
+      }
+      return;
+    }
+
+    const delta = snapMs(drag.deltaMs);
+    if (Math.abs(delta) < 1) return;
+    if (drag.mode === "in") {
+      // Never past the out point: a clip of zero length is a way to lose frames.
+      const next = Math.min(clip.out_ms - 1, Math.max(0, clip.in_ms + delta));
+      invoke("trim_clip", {
+        index: drag.index,
+        in_ms: Math.round(next),
+        out_ms: clip.out_ms,
+      }).catch(() => {});
+    } else {
+      const next = Math.max(clip.in_ms + 1, clip.out_ms + delta);
+      invoke("trim_clip", {
+        index: drag.index,
+        in_ms: clip.in_ms,
+        out_ms: Math.round(next),
+      }).catch(() => {});
+    }
+  }
+
+  /// How a clip is drawn while it is being dragged: trimmed at one end or moved
+  /// along, without the document having been touched.
+  function dragGeometry(i: number) {
+    if (!clipDrag || clipDrag.index !== i) return null;
+    const delta = clipDrag.mode === "move" ? clipDrag.deltaMs : snapMs(clipDrag.deltaMs);
+    if (clipDrag.mode === "in") {
+      return { left: delta, width: -delta };
+    }
+    if (clipDrag.mode === "out") {
+      return { left: 0, width: delta };
+    }
+    return { left: delta, width: 0 };
   }
 
   function beginResize(which: "bottom" | "effects", e: PointerEvent) {
@@ -454,45 +594,59 @@
     <div class="toolbar">
       <div class="transport">
         <button type="button" title="Go to start (Home)" onclick={() => seekTo(0)}>
-          ⏮
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+            <path d={ICON.start} />
+          </svg>
         </button>
         <button
           type="button"
           title="Back one second (Shift+Left)"
           onclick={() => stepSeconds(-1)}
         >
-          ⏪
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+            <path d={ICON.rewind} />
+          </svg>
         </button>
         <button
           type="button"
           title="Back one frame (Left or comma)"
           onclick={() => stepFrames(-1)}
         >
-          ◀
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+            <path d={ICON.stepBack} />
+          </svg>
         </button>
         <button
           type="button"
           title={playing ? "Pause (Space)" : "Play (Space)"}
           onclick={togglePlay}
         >
-          {playing ? "⏸" : "▶"}
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+            <path d={playing ? ICON.pause : ICON.play} />
+          </svg>
         </button>
         <button
           type="button"
           title="Forward one frame (Right or period)"
           onclick={() => stepFrames(1)}
         >
-          ▶
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+            <path d={ICON.stepForward} />
+          </svg>
         </button>
         <button
           type="button"
           title="Forward one second (Shift+Right)"
           onclick={() => stepSeconds(1)}
         >
-          ⏩
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+            <path d={ICON.forward} />
+          </svg>
         </button>
         <button type="button" title="Go to end (End)" onclick={() => seekTo(durationMs)}>
-          ⏭
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+            <path d={ICON.end} />
+          </svg>
         </button>
       </div>
       <div class="timecode selectable" title="position / duration">
@@ -537,7 +691,9 @@
           onclick={undo}
           disabled={undoDepth === 0}
         >
-          ↶
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+            <path d={ICON.undo} />
+          </svg>
         </button>
         <button
           type="button"
@@ -545,7 +701,9 @@
           onclick={redo}
           disabled={redoDepth === 0}
         >
-          ↷
+          <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+            <path d={ICON.redo} />
+          </svg>
         </button>
         <button
           type="button"
@@ -610,7 +768,13 @@
                   <div
                     class="clip"
                     class:selected={i === selectedClip}
-                    style="left: {(entry.start / 1000) * pxPerSecond}px; width: {(entry.duration / 1000) * pxPerSecond}px"
+                    class:dragging={clipDrag?.index === i}
+                    style="left: {((entry.start + (dragGeometry(i)?.left ?? 0)) / 1000) *
+                      pxPerSecond}px; width: {((entry.duration +
+                      (dragGeometry(i)?.width ?? 0)) /
+                      1000) *
+                      pxPerSecond}px"
+                    onpointerdown={(e) => beginClipDrag(i, e)}
                     onclick={(e) => {
                       e.stopPropagation();
                       selectedClip = i;
@@ -657,7 +821,9 @@
               <div class="effect-head">
                 <span>Grade</span>
                 <button type="button" title="Remove this effect" onclick={() => removeEffect(i)}>
-                  ×
+                  <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+                    <path d={ICON.close} />
+                  </svg>
                 </button>
               </div>
               {#each GRADE_CONTROLS as control}
@@ -673,6 +839,17 @@
                       setGradeParam(i, control.k, Number(e.currentTarget.value))}
                   />
                   <span class="param-value">{effect.Grade[control.k].toFixed(2)}</span>
+                  <button
+                    type="button"
+                    class="param-reset"
+                    title="Reset {control.label.toLowerCase()} to its default"
+                    disabled={effect.Grade[control.k] === GRADE_DEFAULTS[control.k]}
+                    onclick={() => setGradeParam(i, control.k, GRADE_DEFAULTS[control.k])}
+                  >
+                    <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+                      <path d={ICON.reset} />
+                    </svg>
+                  </button>
                 </label>
               {/each}
             </div>
@@ -814,7 +991,7 @@
   .effect-head button:hover { color: var(--playhead); }
   .param {
     display: grid;
-    grid-template-columns: 64px 1fr 34px;
+    grid-template-columns: 64px 1fr 34px 14px;
     align-items: center;
     gap: 6px;
     margin: 2px 0;
@@ -834,6 +1011,24 @@
   }
   .add-effect:hover:not(:disabled) { background: var(--bg-hover); }
   .add-effect:disabled { color: var(--text-muted); cursor: default; }
+
+  .icon {
+    width: 12px;
+    height: 12px;
+    fill: currentColor;
+    display: block;
+    margin: 0 auto;
+  }
+  .param-reset {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--text-muted);
+    cursor: pointer;
+    width: 14px;
+  }
+  .param-reset:hover:not(:disabled) { color: var(--text); }
+  .param-reset:disabled { color: transparent; cursor: default; }
 
   .edit { display: flex; gap: 6px; align-items: center; margin-right: 12px; }
   .edit button {
@@ -980,6 +1175,9 @@
     align-items: center;
   }
   .clip.selected { border-color: var(--playhead); background: #46698c; }
+  .clip.dragging { opacity: 0.85; border-color: var(--accent); }
+  .clip { cursor: grab; }
+  .clip.dragging { cursor: grabbing; }
 
   .clip-label {
     padding: 0 6px;
