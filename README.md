@@ -15,6 +15,18 @@ pane, Blender-styled timeline in the bottom 300 px, play/pause/seek/scrub over
 Tauri IPC. The black bars either side of the video are the letterbox working —
 16:9 video in a 2.4:1 pane.
 
+![Cutting, grading and exporting a clip: dragging the playhead, splitting at the
+playhead, moving and trimming clips on the timeline, changing grade parameters
+and watching the picture follow, then exporting and getting 900 frames verified
+in the file](docs/editor-demo.gif)
+
+Forty seconds of it actually being used, from [docs/editor-demo.gif](docs/editor-demo.gif):
+scrubbing, splitting a clip in two, dragging and trimming pieces on the timeline,
+adding a grade and moving its sliders with the frame on screen re-grading as they
+move, a transform that shrinks the picture inside the frame, undo, and an export
+that ends with the frame count verified against the file rather than against what
+it thought it wrote.
+
 ## The machine
 
 Every design decision below follows from these constraints. None of them are

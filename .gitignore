@@ -19,3 +19,6 @@
 
 # Editor local settings
 .zed/
+
+# Source recordings; the README uses the compressed GIF beside them.
+docs/*.webm
